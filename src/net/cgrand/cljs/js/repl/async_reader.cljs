@@ -444,10 +444,11 @@
     (> (.-length a) upto) (reader-error! "Reader bug: read too many forms.")
     :else true))
 
-(defn read-quote [rdr a _]
-  (if (readN rdr a (inc (.-length a)))
-    (do (.push a (list 'quote (.pop a))) true)
-    (on-ready rdr #(do (check %) (.push a (list 'quote (.pop a))) true))))
+(defn read-wrap [sym]
+  (fn [rdr a _]
+    (if (readN rdr a (inc (.-length a)))
+      (do (.push a (list sym (.pop a))) true)
+      (on-ready rdr #(do (check %) (.push a (list sym (.pop a))) true)))))
 
 (defn read-null [rdr a _]
   (if (readN rdr a (inc (.-length a)))
@@ -469,7 +470,6 @@
   (if (readN rdr a (+ 2 (.-length a)))
     (fold-meta a)
     (on-ready rdr #(do (check %) (fold-meta a)))))
-
 
 (defn- tag-line+col [rdr a line col]
   (let [end-line (.-line rdr)
@@ -535,7 +535,57 @@
         :else (if-some [r (macros ch)]
                 (r rdr a ch)
                 (reader-error! "Unexpected character: " (pr-str ch)))))))
-  
+
+(def ^:dynamic *arg-env* nil)
+
+(defn- gen-arg [n]
+  (symbol (str (gensym (str (if (neg? n) "rest" (str "p" n)) "__")) "#")))
+
+(defn- register-arg! [a n]
+  (.push a
+    (or (get *arg-env* n)
+      (let [s (gen-arg n)]
+        (set! *arg-env* (assoc *arg-env* n s))
+        s)))
+  true)
+
+(defn- register-some! [rdr a n]
+  (let [t (when (< n (.-length a)) (.pop a))]
+    (cond
+      (= '& t) (register-arg! a -1)
+      (number? t) (register-arg! a (int t))
+      :else (reader-error "arg literal must be %, %& or %number"))))
+
+(defn read-arg [rdr a ch]
+  (if *arg-env*
+    (let [ch (read-char rdr)]
+      (cond
+        (nil? ch) (-> rdr unread (on-ready #(read-arg % a "%")))
+        (eof? ch) (register-arg! a 1)
+        :else
+        (let [n (.-length a)]
+          (unread rdr)
+          (cond
+            (or (whitespace? ch) (terminating-macros ch)) (register-arg! a 1)
+            (read-some rdr a) (register-some! rdr a n)
+            :else (on-ready rdr #(do (check %) (register-some! % a n)))))))
+    (read-symbol rdr a ch)))
+
+(defn- anon-fn [forms]
+  (let [N (or (first (keys (rsubseq *arg-env* > 0))) 0)
+        args (into [] (map #(or (*arg-env* %) (gen-arg %))) (range 1 (inc N)))
+        args (if-some [r (*arg-env* -1)]
+               (conj args '& r)
+               args)]
+    (set! *arg-env* nil)
+    (list 'fn* args (list* forms))))
+
+(defn read-fn [rdr a ch]
+  (when *arg-env*
+    (reader-error "Nested #()s are not allowed."))
+  (set! *arg-env* (sorted-map))
+  (read-delimited rdr a ")" anon-fn #js []))
+
 ;; root readers
 (defn- read1 [a root-cb read-some]
   (let [ex (volatile! nil)]
@@ -557,7 +607,8 @@
    "_" read-null
    "^" (with-line+col read-meta 2)
    "\"" read-regex
-   "!" read-comment})
+   "!" read-comment
+   "(" read-fn})
 
 (def cljs-macros
   (->
@@ -575,7 +626,9 @@
      "^" (with-line+col read-meta 1)
      "+" read-sym-or-num
      "-" read-sym-or-num
-     "'" (with-line+col read-quote)}
+     "'" (with-line+col (read-wrap 'quote))
+     "@" (with-line+col (read-wrap 'deref))
+     "%" read-arg}
     (into (map vector "0123456789" (repeat read-number)))
     (into (map vector "\t\n\r ," (repeat read-space)))))
 
@@ -604,7 +657,8 @@
                     *terminating-macros* terminating-macros
                     *dispatch-macros* dispatch-macros
                     *default-dispatch-macro* default-dispatch-macro
-                    *error-data* #(-info rdr)]
+                    *error-data* #(-info rdr)
+                    *arg-env* nil]
         (on-ready rdr (read1 #js [] cb (if (= :eofthrow eof) read-some (safe-read-some eof)))))))
   ([rdr cb eof-error? eof-value]
     (read {:eof (if eof-error? :eof-throw eof-value)} rdr cb)))
