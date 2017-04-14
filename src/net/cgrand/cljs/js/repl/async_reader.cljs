@@ -5,7 +5,8 @@
 (defprotocol AsyncPushbackReader
   (read-char [rdr])
   (unread [rdr])
-  (-on-ready [rdr toprdr f]))
+  (-on-ready [rdr toprdr f])
+  (-info [rdr]))
 
 (defn on-ready
   "f is a function of two arguments: an async reader and an array where to push values.
@@ -59,7 +60,8 @@
           (set! col pcol))
         (set! col (dec col)))))
   (-on-ready [_ rdr f]
-    (-on-ready prdr rdr f)))
+    (-on-ready prdr rdr f))
+  (-info [rdr] (assoc (-info prdr) :line line :column col)))
 
 (defn line-col-reader
   ([rdr]
@@ -73,7 +75,8 @@
   AsyncPushbackReader
   (read-char [rdr] (throw e))
   (unread [rdr] (throw e))
-  (-on-ready [rdr rdr f] (throw e)))
+  (-on-ready [rdr rdr f] (throw e))
+  (-info [rdr] {}))
 
 (defn check [rdr]
   (when (instance? FailingReader rdr)
@@ -89,6 +92,7 @@
   (unread [_]
     (set! idx (dec idx))
     nil)
+  (-info [rdr] {})
   (-on-ready [_ rdr cb]
     (if running
       (when cb (.push cb+rdrs cb) (.push cb+rdrs rdr))
@@ -141,7 +145,16 @@
 (def ^:dynamic *in* "A reader implementing AsyncPushbackReader."
   (FailingReader. (js/Error. "No *in* reader set.")))
 
+(def ^:dynamic *error-data*)
+
 ;; readers
+(defn reader-error! [& msg]
+  (throw 
+    (ex-info (apply str msg) (*error-data*))))
+
+(defn eof-error! []
+  (reader-error! "EOF while reading."))
+
 (declare read-some macros ^boolean terminating-macros)
 
 (defn skip [^not-native rdr pred]
@@ -170,7 +183,7 @@
   (let [ch (read-char rdr)]
     (cond
       (nil? ch) (on-ready rdr #(read-delimited % pa end f a))
-      (eof? ch) (throw (js/Error. "EOF while reading")) 
+      (eof? ch) (eof-error!) 
       (identical? end ch) (do (.push pa (f a)) true)
       :else (if (read-some (doto rdr unread) a)
               (recur rdr pa end f a)
@@ -188,7 +201,7 @@
 (defn- map* [kvs]
   (let [n (alength kvs)]
     (when (odd? n)
-      (throw (js/Error. "Map literal must contain an even number of forms.")))
+      (reader-error! "Map literal must contain an even number of forms."))
     (if (<= n (* 2 (.-HASHMAP-THRESHOLD PersistentArrayMap)))
       (.createWithCheck PersistentArrayMap kvs)
       (.createWithCheck PersistentHashMap kvs))))
@@ -288,7 +301,7 @@
                 (re-matches* ratio-pattern s) (match-ratio s)
                 (re-matches* float-pattern s) (match-float s))]
     n
-    (throw (js/Error. (str "Invalid number: " s)))))
+    (reader-error! "Invalid number: " s)))
 
 (defn read-number [rdr a ch]
   (read-tokenized rdr a ch as-number))
@@ -314,18 +327,18 @@
 
 (defn make-unicode-char [code-str]
   (when-not (.test #"^[\da-fA-F]{4}$" code-str)
-    (throw (js/Error. (str "Invalid unicode character: \\u" code-str))))
+    (reader-error! "Invalid unicode character: \\u" code-str))
   (let [code (js/parseInt code-str 16)]
     (when (<= 0xD800 code 0xDFFF)
-      (throw (js/Error. (str "Invalid character constant: \\u" code-str))))
+      (reader-error! "Invalid character constant: \\u" code-str))
     (js/String.fromCharCode code)))
 
 (defn make-octal-char [code-str]
   (when-not (.test #"^[0-7]{1,3}$" code-str)
-    (throw (js/Error. (str "Invalid octal escape sequence: \\o" code-str))))
+    (reader-error! "Invalid octal escape sequence: \\o" code-str))
   (let [code (js/parseInt code-str 8)]
     (when-not (<= 0 code 255)
-      (throw (js/Error. "Octal escape sequence must be in range [0, 377].")))
+      (reader-error! "Octal escape sequence must be in range [0, 377]."))
     (js/String.fromCharCode code)))
 
 (defn as-char [chars]
@@ -339,13 +352,13 @@
     (identical? chars "formfeed")  "\f"
     (identical? (.charAt chars 0) "u") (make-unicode-char (subs chars 1))
     (identical? (.charAt chars 0) "o") (make-octal-char (subs chars 1))
-    :else (throw (js/Error. (str "Unknown character literal: \\" chars)))))
+    :else (reader-error! "Unknown character literal: \\" chars)))
 
 (defn read-charlit [rdr a _]
   (read-tokenized rdr a "" as-char))
 
 (defn read-unbalanced [rdr a ch]
-  (throw (js/Error. (str "Unmatched delimiter " ch))))
+  (reader-error! "Unmatched delimiter " ch))
 
 (defn as-keyword [token]
   (let [a (re-matches* symbol-pattern token)
@@ -356,7 +369,7 @@
                  (identical? (. ns (substring (- (.-length ns) 2) (.-length ns))) ":/"))
             (identical? (aget name (dec (.-length name))) ":")
             (not (== (.indexOf token "::" 1) -1)))
-      (throw (js/Error. (str "Invalid token: " token)))
+      (reader-error! "Invalid token: " token)
       (if (and (not (nil? ns)) (> (.-length ns) 0))
         (keyword (.substring ns 0 (.indexOf ns "/")) name)
         (keyword token)))))
@@ -368,22 +381,21 @@
   (if (pos? len)
     (let [ch (read-char rdr)]
       (cond
-        (eof? ch) (throw (js/Error. "EOF while reading"))
+        (eof? ch) (eof-error!)
         (nil? ch) (on-ready rdr #(read-num-escape % len base n sb))
         :else (let [d (js/parseInt ch base)]
                 (if (js/isNaN d)
                   ; not a digit
                   (if (= base 8) ; not exact length
                     (recur (doto rdr unread) 0 8 n sb)
-                    (js/Error.
-                      (str "Invalid unicode character escape length: " n ", should be 4.") ))
+                    (reader-error! "Invalid unicode character escape length: " n ", should be 4."))
                   (recur rdr (dec len) base (+ (* n base) d) sb)))))
     (do (.append sb (js/String.fromCharCode n)) true)))
 
 (defn parse-string [^not-native rdr a esc sb]
   (let [ch (read-char rdr)]
     (cond
-      (eof? ch) (throw (js/Error. "EOF while reading"))
+      (eof? ch) (eof-error!)
       (nil? ch) (on-ready rdr #(parse-string % a esc sb))
       esc (case ch
             \t (recur rdr a false (.append sb "\t"))
@@ -398,7 +410,7 @@
             (\0 \1 \2 \3 \4 \5 \6 \7) (if (read-num-escape rdr 2 8 (js/parseInt ch 8) sb)
                                         (recur rdr a false sb)
                                         (on-ready rdr #(parse-string % a false sb)))
-            (throw (js/Error. (str "Unsupported escape character: \\" ch))))
+            (reader-error! "Unsupported escape character: \\" ch))
       (identical? "\\" ch) 
       (recur rdr a true sb)
       (identical? \" ch) (do (.push a (.toString sb)) true)
@@ -413,7 +425,7 @@
     (if (read-some rdr a)
       (recur rdr a upto)
       (on-ready rdr #(readN % a upto)))
-    (> (.-length a) upto) (throw (js/Error. "Reader bug: read too many forms."))
+    (> (.-length a) upto) (reader-error! "Reader bug: read too many forms.")
     :else true))
 
 (defn read-quote [rdr a _]
@@ -433,7 +445,7 @@
             (map? m) m
             (keyword? m) {m true}
             (or (symbol? m) (string? m)) {:tag m}
-            :else (throw (js/Error. "Metadata must be Symbol,Keyword,String or Map")))]
+            :else (reader-error! "Metadata must be Symbol,Keyword,String or Map"))]
     (.push a (vary-meta v merge m))
     true))
 
@@ -469,10 +481,10 @@
 (defn read-dispatch [^not-native rdr a _]
   (let [ch (read-char rdr)]
     (cond
-      (eof? ch) (throw (js/Error. "EOF while reading"))
+      (eof? ch) (eof-error!)
       (nil? ch) (on-ready rdr #(read-dispatch % a nil))
       :else
-      (let [f (or (aget *dispatch-macros* (.charCodeAt ch 0) nil) *default-dispatch-macro*)]
+      (let [f (or (aget *dispatch-macros* (.charCodeAt ch 0)) *default-dispatch-macro*)]
         (f rdr a ch)))))
 
 (def ^:dynamic *macros* #js [])
@@ -492,11 +504,11 @@
   [^not-native rdr a]
   (let [ch (read-char rdr)]
     (cond
-      (eof? ch) (throw (js/Error. "EOF while reading"))
+      (eof? ch) (eof-error!)
       (nil? ch) (on-ready rdr #(read-some % a))
       :else (if-some [r (macros ch)]
               (r rdr a ch)
-              (throw (js/Error. (str "Unexpected character: " (pr-str ch))))))))
+              (reader-error! "Unexpected character: " (pr-str ch))))))
 
 (defn safe-read-some [eof-value]
   (fn self [^not-native rdr a]
@@ -506,7 +518,7 @@
         (nil? ch) (on-ready rdr #(self % a))
         :else (if-some [r (macros ch)]
                 (r rdr a ch)
-                (throw (js/Error. (str "Unexpected character: " (pr-str ch)))))))))
+                (reader-error! "Unexpected character: " (pr-str ch)))))))
   
 ;; root readers
 (defn- read1 [a root-cb read-some]
@@ -574,7 +586,8 @@
                     *default-macro* default-macro
                     *terminating-macros* terminating-macros
                     *dispatch-macros* dispatch-macros
-                    *default-dispatch-macro* default-dispatch-macro]
+                    *default-dispatch-macro* default-dispatch-macro
+                    *error-data* #(-info rdr)]
         (on-ready rdr (read1 #js [] cb (if (= :eofthrow eof) read-some (safe-read-some eof)))))))
   ([rdr cb eof-error? eof-value]
     (read {:eof (if eof-error? :eof-throw eof-value)} rdr cb)))
