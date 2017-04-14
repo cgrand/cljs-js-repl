@@ -414,10 +414,26 @@
       (identical? "\\" ch) 
       (recur rdr a true sb)
       (identical? \" ch) (do (.push a (.toString sb)) true)
-      :else (recur rdr a esc (doto sb (.append ch))))))
+      :else (recur rdr a esc (.append sb ch)))))
 
 (defn read-stringlit [rdr a _]
   (parse-string rdr a false (gstring/StringBuffer.)))
+
+(defn parse-regex [^not-native rdr a esc sb]
+  (let [ch (read-char rdr)]
+    (cond
+      (eof? ch) (eof-error!)
+      (nil? ch) (on-ready rdr #(parse-regex % a esc sb))
+      esc (recur rdr a false
+            (if (or (identical? \" ch) (identical? \\ ch))
+              (.append sb ch)
+              (-> (.append sb \\) (.append sb ch))))
+      (identical? "\\" ch) (recur rdr a true sb)
+      (identical? \" ch) (do (.push a (re-pattern (.toString sb))) true)
+      :else (recur rdr a esc (.append sb ch)))))
+
+(defn read-regex [rdr a _]
+  (parse-regex rdr a false (gstring/StringBuffer.)))
 
 (defn- readN [^not-native rdr a upto]
   (cond
@@ -540,6 +556,7 @@
   {"{" (with-line+col read-set 2)
    "_" read-null
    "^" (with-line+col read-meta 2)
+   "\"" read-regex
    "!" read-comment})
 
 (def cljs-macros
