@@ -57,7 +57,9 @@
 
    \"Push\" the specified bindings and returns a 0-arg fn to call to \"pop\" them and restore original values."
   [bindings]
-  (let [dynvars-to-be-overwritten (aget bindings 0)
-        backup (snapshot-bindings dynvars-to-be-overwritten)]
-    (restore-snapshot! bindings dynvars-to-be-overwritten)
-    #(restore-snapshot! backup dynvars-to-be-overwritten)))
+  (if bindings
+    (let [dynvars-to-be-overwritten (aget bindings 0)
+          backup (snapshot-bindings dynvars-to-be-overwritten)]
+      (restore-snapshot! bindings dynvars-to-be-overwritten)
+      #(restore-snapshot! backup dynvars-to-be-overwritten))
+    #()))

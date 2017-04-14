@@ -1,114 +1,178 @@
 (ns net.cgrand.cljs.js.repl.async-reader
-  (:require [goog.string :as gstring]))
+  (:require [goog.string :as gstring]
+    [net.cgrand.cljs.js.repl.dynvars :as dyn]))
   
 (defprotocol AsyncPushbackReader
   (read-char [rdr])
   (unread [rdr])
-  (on-ready [rdr f]
-    "f is a function of two arguments: an async reader and an array where to push values.
-     f will be called as soon as input is available.
-     f returns true when no additional input is required."))
-  
+  (-on-ready [rdr toprdr f]))
+
+(defn on-ready
+  "f is a function of two arguments: an async reader and an array where to push values.
+   f will be called as soon as input is available.
+   f must return true when no additional input is required."
+  [rdr f]
+  (-on-ready rdr rdr f))
+
 (def eof? false?)
-  
-(defn failing-input [e]
-  (reify AsyncPushbackReader
-    (read-char [rdr] (throw e))
-    (unread [rdr] (throw e))
-    (on-ready [rdr f] (throw e))))
+
+(defn- skip-lf [^not-native rdr]
+  (let [ch (read-char rdr)]
+    (cond
+      (identical? "\n" ch) true
+      (nil? ch) (on-ready rdr skip-lf)
+      :else (do (unread rdr) true))))
+
+(deftype LineColNumberingReader [^not-native prdr ^:mutable col ^:mutable pcol ^:mutable line]
+  AsyncPushbackReader
+  (read-char [rdr]
+    (let [ch (read-char prdr)]
+      (cond
+        (identical? ch "\r") 
+        (do
+          (set! line (inc line))
+          (set! pcol col)
+          (set! col 0)
+          (let [ch (read-char prdr)]
+            (cond
+              (identical? "\n" ch) "\n"
+              (nil? ch) (on-ready rdr skip-lf)
+              :else (do (unread prdr) "\n")))
+          (set! skip-lf true)
+          "\n")
+        (identical? ch "\n") (do
+                               (set! line (inc line))
+                               (set! pcol col)
+                               (set! col 0)
+                               ch)
+        :else (do
+                (set! col (inc col))
+                ch))))
+  (unread [rdr]
+    (unread prdr)
+    (let [ch (read-char prdr)]
+      (unread prdr)
+      ; assuming that never more than one character is unread
+      (if (or (identical? "\n" ch) (identical? "\r" ch))
+        (do
+          (set! line (dec line))
+          (set! col pcol))
+        (set! col (dec col)))))
+  (-on-ready [_ rdr f]
+    (-on-ready prdr rdr f)))
+
+(defn line-col-reader
+  ([rdr]
+    (line-col-reader rdr 1 0))
+  ([rdr line]
+    (line-col-reader rdr line 0))
+  ([rdr line col]
+    (LineColNumberingReader. rdr col 0 line)))
+
+(deftype FailingReader [e]
+  AsyncPushbackReader
+  (read-char [rdr] (throw e))
+  (unread [rdr] (throw e))
+  (-on-ready [rdr rdr f] (throw e)))
+
+(defn check [rdr]
+  (when (instance? FailingReader rdr)
+    (throw (.-e rdr))))
+
+(deftype Pipe [^:mutable running ^:mutable s ^:mutable idx ^:mutable cb+rdrs ^:mutable sentinel
+               ^:mutable bindings]
+  AsyncPushbackReader
+  (read-char [_]
+    (if-some [ch (aget s idx)]
+      (do (set! idx (inc idx)) ch)
+      sentinel))
+  (unread [_]
+    (set! idx (dec idx))
+    nil)
+  (-on-ready [_ rdr cb]
+    (if running
+      (when cb (.push cb+rdrs cb) (.push cb+rdrs rdr))
+      (do ; not running
+        (when cb
+          (when (pos? (.-length cb+rdrs))
+            (throw (js/Error. "This reader has already one consumer.")))
+          (.push cb+rdrs cb)
+          (.push cb+rdrs rdr))
+        (dyn/with-bindings bindings
+          (set! running true)
+          (let [conts cb+rdrs]
+            (set! cb+rdrs #js [0 0])
+            (loop [erdr nil]
+              (when-some [cont (.shift conts)]
+                (let [rdr (.shift conts)
+                      r (try (boolean (cont (or erdr rdr)))
+                          (catch :default e
+                            (set! (.-length cb+rdrs) 2)
+                            (FailingReader. e)))]
+                  (cond
+                    (true? r) (recur nil)
+                    r (recur r)))))
+            (.apply js/Array.prototype.splice conts cb+rdrs)
+            (set! cb+rdrs conts)
+            (set! bindings (when (pos? (.-length cb+rdrs))
+                             (dyn/get-bindings)))
+            (set! running false)))))
+    nil)
+  IFn
+  (-invoke [rdr] ; EOF
+    (set! sentinel false))
+  (-invoke [rdr s'] ; append input
+    (when (eof? sentinel)
+      (throw (js/Error. "Can't print on a closed reader.")))
+    (set! s (str (subs s idx) s'))
+    (set! idx 0)))
 
 (defn create-pipe
   "Creates a pipe. Returns a map containing two keys: :in and :print-fn.
   The :in value is an async reader suitable to use as *in* or to pass to read.
   The :print-fn is a fn suitable as *print-fn*. It supports a 0-arity to close the pipe."
   []
-  (let [running (volatile! false)
-        s (volatile! "")
-        idx (volatile! 0)
-        cbs (volatile! #js [])
-        sentinel (volatile! nil)
-        run-callbacks!
-        (fn [rdr]
-          (when-not @running
-            (vreset! running true)
-            (try
-              (let [conts @cbs]
-                (vreset! cbs #js [0 0])
-                (loop [rdr rdr]
-                  (when rdr
-                    (recur
-                      (try
-                       (when (when-some [cont (.shift conts)] (cont rdr))
-                         rdr)
-                       (catch :default e
-                         (set! (.-length @cbs) 2)
-                         (failing-input e))))))
-              (do
-                (.apply js/Array.prototype.splice conts @cbs)
-                (vreset! cbs conts)))
-              (finally
-                (vreset! running false)))))
-        rdr
-        (reify AsyncPushbackReader
-          (read-char [_]
-            (let [i @idx]
-              (if-some [ch (aget @s i)]
-                (do (vreset! idx (inc i)) ch)
-                @sentinel)))
-          (unread [_]
-            (vswap! idx dec)
-            nil)
-          (on-ready [rdr cb]
-            (.push @cbs cb)
-            (run-callbacks! rdr)
-            nil))]
-    {:print-fn
-     (fn 
-       ([] ; EOF
-         (vreset! sentinel false)
-         (run-callbacks! rdr)
-         true)
-       ([s']
-         (when (eof? @sentinel)
-           (throw (js/Error. "Can't print on a closed reader.")))
-         (vreset! s (str (subs @s @idx) s'))
-         (vreset! idx 0) ; set EOF
-         (run-callbacks! rdr)
-       true))
-     :in rdr}))
+  (let [pipe (Pipe. false "" 0 #js [] nil nil)]
+    {:print-fn (fn
+                 ([] (pipe) (on-ready pipe nil))
+                 ([s] (pipe s) (on-ready pipe nil)))
+     :in pipe}))
 
 (def ^:dynamic *in* "A reader implementing AsyncPushbackReader."
-  (failing-input (js/Error. "No *in* reader set.")))
+  (FailingReader. (js/Error. "No *in* reader set.")))
 
 ;; readers
-(declare read-some macros terminating-macros)
+(declare read-some macros ^boolean terminating-macros)
 
-(defn skip [rdr pred]
+(defn skip [^not-native rdr pred]
   (let [ch (read-char rdr)]
     (cond
+      (pred ch) (recur rdr pred)
       (eof? ch) true
       (nil? ch) (on-ready rdr #(skip % pred))
-      (pred ch) (recur rdr pred)
       :else (do (unread rdr) true))))
 
-(defn whitespace? [ch]
-  (gstring/contains " \t\r\n," ch))
+(defn- ^boolean whitespace?
+  "Checks whether a given character is whitespace"
+  [ch]
+  (.test #"^[ \t\n\r,]$" ch))
 
 (defn read-space [rdr _ _]
   (skip rdr whitespace?))
 
-(defn not-newline? [ch]
-  (not (gstring/contains "\r\n" ch)))
+(defn- ^boolean not-newline? [ch]
+  (.test #"^[^\r\n]$" ch))
 
 (defn read-comment [rdr _ _]
   (skip rdr not-newline?))
   
-(defn read-delimited [rdr pa end f a]
+(defn read-delimited [^not-native rdr pa end f a]
   (let [ch (read-char rdr)]
     (cond
+      (nil? ch) (on-ready rdr #(read-delimited % pa end f a))
       (eof? ch) (throw (js/Error. "EOF while reading")) 
-      (= end ch) (do (.push pa (f a)) true)
-      :else (if (read-some (doto rdr unread) a) ; nil is implicitely handled
+      (identical? end ch) (do (.push pa (f a)) true)
+      :else (if (read-some (doto rdr unread) a)
               (recur rdr pa end f a)
               (on-ready rdr #(read-delimited % pa end f a))))))
   
@@ -132,16 +196,16 @@
 (defn read-map [rdr a _]
   (read-delimited rdr a "}" map* #js []))
   
-(defn read-token [rdr a sb]
+(defn read-token [^not-native rdr a sb]
   (let [ch (read-char rdr)]
     (cond
       (nil? ch) (on-ready rdr #(read-token % a sb))
       (eof? ch) (do (.push a (.toString sb)) true)
-      (goog.object/containsKey terminating-macros ch)
+      (terminating-macros ch)
       (do (unread rdr) (.push a (.toString sb)) true)
       :else (recur rdr a (.append sb ch)))))
   
-  ;;;; begin copy from cljs.reader
+;;;; begin copy from cljs.reader
 (def int-pattern (re-pattern "^([-+]?)(?:(0)|([1-9][0-9]*)|0[xX]([0-9A-Fa-f]+)|0([0-7]+)|([1-9][0-9]?)[rR]([0-9A-Za-z]+))(N)?$"))
 (def ratio-pattern (re-pattern "^([-+]?[0-9]+)/([0-9]+)$"))
 (def float-pattern (re-pattern "^([-+]?[0-9]+(\\.[0-9]*)?([eE][-+]?[0-9]+)?)(M)?$"))
@@ -213,7 +277,7 @@
 
 ;;;; end copy from cljs.reader
 
-(defn read-tokenized [rdr a ch f]
+(defn read-tokenized [^not-native rdr a ch f]
   (if (read-token rdr a (goog.string/StringBuffer. ch))
     (do (->> (.pop a) f (.push a)) true)
     (on-ready rdr (fn [_] (->> (.pop a) f (.push a)) true))))
@@ -240,12 +304,12 @@
 (defn read-symbol [rdr a ch]
   (read-tokenized rdr a ch as-symbol))
 
-(defn read-sym-or-num [rdr a ch]
+(defn read-sym-or-num [^not-native rdr a ch]
   (let [ch' (read-char rdr)]
     (cond
       (eof? ch') (read-symbol rdr a ch)
       (nil? ch') (on-ready rdr #(read-sym-or-num % a ch))
-      (gstring/contains "0123456789" ch') (do (unread rdr) (read-number rdr a ch))
+      (.test #"^\d$" ch') (do (unread rdr) (read-number rdr a ch))
       :else (do (unread rdr) (read-symbol rdr a ch)))))
 
 (defn make-unicode-char [code-str]
@@ -300,7 +364,7 @@
 (defn read-keyword [rdr a _]
   (read-tokenized rdr a "" as-keyword))
 
-(defn read-num-escape [rdr len base n sb]
+(defn read-num-escape [^not-native rdr len base n sb]
   (if (pos? len)
     (let [ch (read-char rdr)]
       (cond
@@ -316,7 +380,7 @@
                   (recur rdr (dec len) base (+ (* n base) d) sb)))))
     (do (.append sb (js/String.fromCharCode n)) true)))
 
-(defn parse-string [rdr a esc sb]
+(defn parse-string [^not-native rdr a esc sb]
   (let [ch (read-char rdr)]
     (cond
       (eof? ch) (throw (js/Error. "EOF while reading"))
@@ -343,61 +407,89 @@
 (defn read-stringlit [rdr a _]
   (parse-string rdr a false (gstring/StringBuffer.)))
 
-(defn- skip-form [rdr a n]
-  (if (> (.-length a) n)
-    (do (.pop a) true)
+(defn- readN [^not-native rdr a upto]
+  (cond
+    (< (.-length a) upto)
     (if (read-some rdr a)
-      (recur rdr a n)
-      (on-ready rdr #(skip-form % a n)))))
+      (recur rdr a upto)
+      (on-ready rdr #(readN % a upto)))
+    (> (.-length a) upto) (throw (js/Error. "Reader bug: read too many forms."))
+    :else true))
+
+(defn read-quote [rdr a _]
+  (if (readN rdr a (inc (.-length a)))
+    (do (.push a (list 'quote (.pop a))) true)
+    (on-ready rdr #(do (check %) (.push a (list 'quote (.pop a))) true))))
 
 (defn read-null [rdr a _]
-  (skip-form rdr a (.-length a)))
+  (if (readN rdr a (inc (.-length a)))
+    (do (.pop a) true)
+    (on-ready rdr #(do (check %) (.pop a) true))))
 
-(def dispatch-macros
-  (clj->js
-    {"{" read-set
-     "_" read-null
-     "!" read-comment}))
+(defn- fold-meta [a]
+  (let [v (.pop a)
+        m (.pop a)
+        m (cond
+            (map? m) m
+            (keyword? m) {m true}
+            (or (symbol? m) (string? m)) {:tag m}
+            :else (throw (js/Error. "Metadata must be Symbol,Keyword,String or Map")))]
+    (.push a (vary-meta v merge m))
+    true))
 
-(defn read-dispatch [rdr a _]
+(defn read-meta [rdr a _]
+  (if (readN rdr a (+ 2 (.-length a)))
+    (fold-meta a)
+    (on-ready rdr #(do (check %) (fold-meta a)))))
+
+
+(defn- tag-line+col [rdr a line col]
+  (let [end-line (.-line rdr)
+        end-col (.-col rdr)
+        v (.pop a)]
+    (when-not (or (boolean? v) (nil? v)) ; as read-symbol may push them
+      (.push a (vary-meta v merge {:line line :column col :end-line end-line :end-column end-col})))
+    true))
+
+(defn with-line+col
+  ([r] (with-line+col r 1))
+  ([r offset]
+    (fn [rdr a ch]
+      (if (instance? LineColNumberingReader rdr)
+        (let [line (.-line rdr)
+              col (- (.-col rdr) offset)]
+          (if (r rdr a ch)
+            (tag-line+col rdr a line col)
+            (on-ready rdr #(do (check %) (tag-line+col % a line col)))))
+        (r rdr a ch)))))
+
+(def ^:dynamic *dispatch-macros* #js [])
+(def ^:dynamic *default-dispatch-macro* #(str "No dispatch macro for #" %3))
+
+(defn read-dispatch [^not-native rdr a _]
   (let [ch (read-char rdr)]
     (cond
       (eof? ch) (throw (js/Error. "EOF while reading"))
       (nil? ch) (on-ready rdr #(read-dispatch % a nil))
       :else
-      (if-some [f (goog.object/get dispatch-macros ch nil)]
-        (f rdr a ch)
-        (throw (js/Error. (str "No dispatch macro for #" ch)))))))
+      (let [f (or (aget *dispatch-macros* (.charCodeAt ch 0) nil) *default-dispatch-macro*)]
+        (f rdr a ch)))))
 
-(def all-macros
-  (->
-    {"\"" read-stringlit 
-     ":" read-keyword
-     ";" read-comment
-     "(" read-list
-     "[" read-vector
-     "{" read-map
-     "}" read-unbalanced
-     "]" read-unbalanced
-     ")" read-unbalanced
-     "\\" read-charlit
-     "#" read-dispatch
-     "+" read-sym-or-num
-     "-" read-sym-or-num}
-    (into (map vector "0123456789" (repeat read-number)))
-    (into (map vector "\t\n\r ," (repeat read-space)))
-    clj->js))
-  
+(def ^:dynamic *macros* #js [])
+
+(def ^:dynamic *default-macro* #(str "No macro for #" %3))
+
 (defn macros [ch]
-  (goog.object/get all-macros ch read-symbol))
-  
-(def terminating-macros
-  (reduce (fn [o ch] (doto o (goog.object/remove ch))) 
-    (goog.object/clone all-macros) ":+-0123456789#'%"))
-  
+  (or (aget *macros* (.charCodeAt ch 0)) *default-macro*))
+
+(def ^:dynamic *terminating-macros* #js [])
+
+(defn ^boolean terminating-macros [ch]
+  (some? (aget *terminating-macros* (.charCodeAt ch 0))))
+
 (defn read-some
   "Read at most one form and pushes it to a."
-  [rdr a]
+  [^not-native rdr a]
   (let [ch (read-char rdr)]
     (cond
       (eof? ch) (throw (js/Error. "EOF while reading"))
@@ -407,7 +499,7 @@
               (throw (js/Error. (str "Unexpected character: " (pr-str ch))))))))
 
 (defn safe-read-some [eof-value]
-  (fn self [rdr a]
+  (fn self [^not-native rdr a]
     (let [ch (read-char rdr)]
       (cond
         (eof? ch) (do (.push a eof-value) true)
@@ -417,14 +509,58 @@
                 (throw (js/Error. (str "Unexpected character: " (pr-str ch)))))))))
   
 ;; root readers
-(defn- read1 [rdr a root-cb read-some]
-  (let [ex (volatile! nil)
-        r (or (pos? (alength a)) (try (read-some rdr a) (catch :default e (vreset! ex e))))]
-    (cond
-      @ex (do (root-cb nil @ex) true)
-      (pos? (alength a)) (do (root-cb (aget a 0) nil) true)
-      :else (on-ready rdr #(read1 % a root-cb read-some)))))
-  
+(defn- read1 [a root-cb read-some]
+  (let [ex (volatile! nil)]
+    (fn self [^not-native rdr]
+      (let [r (or (pos? (alength a)) (try (read-some rdr a) (catch :default e (vreset! ex e))))]
+        (cond
+          @ex (do (root-cb nil @ex) true)
+          (pos? (alength a)) (do (root-cb (aget a 0) nil) true)
+          :else (on-ready rdr self))))))
+
+(defn macros-table [m]
+  (let [a (object-array 128)]
+    (doseq [[ch f] m]
+      (aset a (.charCodeAt ch 0) f))
+    a))
+
+(def cljs-dispatch-macros
+  {"{" (with-line+col read-set 2)
+   "_" read-null
+   "^" (with-line+col read-meta 2)
+   "!" read-comment})
+
+(def cljs-macros
+  (->
+    {"\"" read-stringlit 
+     ":" read-keyword
+     ";" read-comment
+     "(" (with-line+col read-list)
+     "[" (with-line+col read-vector)
+     "{" (with-line+col read-map)
+     "}" read-unbalanced
+     "]" read-unbalanced
+     ")" read-unbalanced
+     "\\" read-charlit
+     "#" read-dispatch
+     "^" (with-line+col read-meta 1)
+     "+" read-sym-or-num
+     "-" read-sym-or-num
+     "'" (with-line+col read-quote)}
+    (into (map vector "0123456789" (repeat read-number)))
+    (into (map vector "\t\n\r ," (repeat read-space)))))
+
+(def cljs-terminating-macros
+  (reduce dissoc cljs-macros ":+-0123456789#'%"))
+
+(def ^:private default-read-opts
+  {:eof :eofthrow
+   :macros (macros-table cljs-macros)
+   :default-macro (with-line+col read-symbol)
+   :terminating-macros (macros-table cljs-terminating-macros)
+   :dispatch-macros (macros-table cljs-dispatch-macros)
+   :default-dispatch-macro #(str "No dispatch macro for #" %3)})
+
 (defn read
   "Like usual read but takes an additional last argument: a callback.
    The callback takes two arguments value and error. It will be called when a value is read or
@@ -432,13 +568,21 @@
   ([cb] (read *in* cb))
   ([rdr cb]
     (read rdr cb true nil))
-  ([opts rdr cb] :TODO)
+  ([opts rdr cb]
+    (let [{:keys [eof macros default-macro terminating-macros dispatch-macros default-dispatch-macro]} (into default-read-opts opts)]
+      (dyn/binding [*macros* macros
+                    *default-macro* default-macro
+                    *terminating-macros* terminating-macros
+                    *dispatch-macros* dispatch-macros
+                    *default-dispatch-macro* default-dispatch-macro]
+        (on-ready rdr (read1 #js [] cb (if (= :eofthrow eof) read-some (safe-read-some eof)))))))
   ([rdr cb eof-error? eof-value]
-    (read1 rdr #js [] cb (if eof-error? read-some (safe-read-some eof-value)))))
+    (read {:eof (if eof-error? :eof-throw eof-value)} rdr cb)))
 
 (defn read-string
   ([s]
     (let [{:keys [in print-fn]} (create-pipe)
+          in (line-col-reader in)
           ret #js [nil nil]]
       (print-fn s)
       (print-fn)
@@ -448,20 +592,19 @@
         (aget ret 0))))
   ([opts s]))
 
+(defn with-string [s f]
+  (let [{:keys [in print-fn]} (create-pipe)
+        ret #js [nil nil]]
+    (print-fn s)
+    (print-fn)
+    (on-ready in f)))
+
 (comment
-  (let [{:keys [in] write :print-fn} (create-pipe)] 
-    (read in (partial prn '>))
+  (let [{:keys [in] write :print-fn} (r/create-pipe)] 
     (write "(12(:fo")
-    (write "o))]32")
-    (read in (partial prn '>>))
-    (read in (partial prn '>>>)))
-  
-  (let [{:keys [in] write :print-fn} (create-pipe)]
-    (write "; hello ")
-    (read in (partial prn '>))
-    (read in (partial prn '>>) false :eof)
-    (write "4\n32")
-    (write)))
+    (r/read in (partial prn '>))
+    
+    (write "o))]32")))
 
 
 (comment
