@@ -1,6 +1,9 @@
 (ns net.cgrand.cljs.js.repl.async-reader
   (:require [goog.string :as gstring]
-    [net.cgrand.cljs.js.repl.dynvars :as dyn]))
+    [net.cgrand.cljs.js.repl.dynvars :as dyn]
+    [cljs.analyzer :as ana]
+    [cljs.env :as env])
+  (:require-macros [net.cgrand.cljs.js.repl.async-reader :refer [bound-read]]))
   
 (defprotocol AsyncPushbackReader
   (read-char [rdr])
@@ -80,7 +83,8 @@
 
 (defn check [rdr]
   (when (instance? FailingReader rdr)
-    (throw (.-e rdr))))
+    (throw (.-e rdr)))
+  true)
 
 (deftype Pipe [^:mutable running ^:mutable s ^:mutable idx ^:mutable cb+rdrs ^:mutable sentinel
                ^:mutable bindings]
@@ -119,7 +123,7 @@
             (.apply js/Array.prototype.splice conts cb+rdrs)
             (set! cb+rdrs conts)
             (set! bindings (when (pos? (.-length cb+rdrs))
-                             (dyn/get-bindings)))
+                             (dyn/get-binding-env)))
             (set! running false)))))
     nil)
   IFn
@@ -146,6 +150,20 @@
   (FailingReader. (js/Error. "No *in* reader set.")))
 
 (def ^:dynamic *error-data*)
+
+(def ^:dynamic *dispatch-macros* #js [])
+(def ^:dynamic *default-dispatch-macro* #(str "No dispatch macro for #" %3))
+
+(def ^:dynamic *suppress-read* false)
+(def ^:dynamic *read-eval* false)
+(def ^:dynamic *data-readers* {})
+(def ^:dynamic  *default-data-reader-fn* nil)
+
+(def ^:dynamic *reading-cond* "true while reading a reader conditional" false)
+
+(def ^:dynamic *read-cond-mode* ":allow or :preserve or falsey")
+
+(def ^:dynamic *read-cond-features* #{})
 
 ;; readers
 (defn reader-error! [& msg]
@@ -178,7 +196,7 @@
 
 (defn read-comment [rdr _ _]
   (skip rdr not-newline?))
-  
+
 (defn read-delimited [^not-native rdr pa end f a]
   (let [ch (read-char rdr)]
     (cond
@@ -188,9 +206,15 @@
       :else (if (read-some (doto rdr unread) a)
               (recur rdr pa end f a)
               (on-ready rdr #(read-delimited % pa end f a))))))
-  
+
+(defn- list' [a]
+  (loop [l () i (dec (.-length a))]
+    (if (neg? i)
+      l
+      (recur (conj l (aget a i)) (dec i)))))
+
 (defn read-list [rdr a _]
-  (read-delimited rdr a ")" list* #js []))
+  (read-delimited rdr a ")" list' #js []))
   
 (defn read-vector [rdr a _]
   (read-delimited rdr a "]" vec #js []))
@@ -218,11 +242,12 @@
       (do (unread rdr) (.push a (.toString sb)) true)
       :else (recur rdr a (.append sb ch)))))
   
+(def symbol-pattern (re-pattern "^(::|:)?(?:([^0-9/:][^/]*)/)?([^0-9].*)$"))
+
 ;;;; begin copy from cljs.reader
 (def int-pattern (re-pattern "^([-+]?)(?:(0)|([1-9][0-9]*)|0[xX]([0-9A-Fa-f]+)|0([0-7]+)|([1-9][0-9]?)[rR]([0-9A-Za-z]+))(N)?$"))
 (def ratio-pattern (re-pattern "^([-+]?[0-9]+)/([0-9]+)$"))
 (def float-pattern (re-pattern "^([-+]?[0-9]+(\\.[0-9]*)?([eE][-+]?[0-9]+)?)(M)?$"))
-(def symbol-pattern (re-pattern "^[:]?([^0-9/].*/)?([^0-9/][^/]*)$"))
   
 (defn- re-matches* [re s]
   (let [matches (.exec re s)]
@@ -262,14 +287,6 @@
 (defn- match-float [s]
   (js/parseFloat s))
  
-(defn special-symbols [t not-found]
-  (cond
-    (identical? t "nil") nil
-    (identical? t "true") true
-    (identical? t "false") false
-    (identical? t "/") '/
-    :else not-found))
-
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; unicode
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -293,7 +310,7 @@
 (defn read-tokenized [^not-native rdr a ch f]
   (if (read-token rdr a (goog.string/StringBuffer. ch))
     (do (->> (.pop a) f (.push a)) true)
-    (on-ready rdr (fn [_] (->> (.pop a) f (.push a)) true))))
+    (on-ready rdr #(do (check %) (->> (.pop a) f (.push a)) true))))
 
 (defn as-number [s]
   (if-some [n (cond
@@ -307,12 +324,16 @@
   (read-tokenized rdr a ch as-number))
 
 (defn as-symbol [token]
-  (if (and (gstring/contains token "/")
-        (not (== (.-length token) 1)))
-    (symbol (subs token 0 (.indexOf token "/"))
-      (subs token (inc (.indexOf token "/"))
-        (.-length token)))
-    (special-symbols token (symbol token))))
+  (let [a (re-matches* symbol-pattern token)
+        token (aget a 0)
+        ns (aget a 2)
+        name (aget a 3)]
+    (cond
+      ns (symbol ns name)
+      (identical? "true" name) true
+      (identical? "false" name) false
+      (identical? "nil" name) nil
+      :else (symbol nil name))))
 
 (defn read-symbol [rdr a ch]
   (read-tokenized rdr a ch as-symbol))
@@ -360,22 +381,28 @@
 (defn read-unbalanced [rdr a ch]
   (reader-error! "Unmatched delimiter " ch))
 
+(defn resolve-ns [alias-or-nsname]
+  (let [alias-or-nsname (if (string? alias-or-nsname) (symbol alias-or-nsname) alias-or-nsname)]
+    (if (ana/get-namespace alias-or-nsname)
+      alias-or-nsname
+      (ana/resolve-ns-alias (assoc @env/*compiler* :ns (ana/get-namespace ana/*cljs-ns*)) alias-or-nsname nil))))
+
 (defn as-keyword [token]
   (let [a (re-matches* symbol-pattern token)
         token (aget a 0)
-        ns (aget a 1)
-        name (aget a 2)]
-    (if (or (and (not (undefined? ns))
-                 (identical? (. ns (substring (- (.-length ns) 2) (.-length ns))) ":/"))
-            (identical? (aget name (dec (.-length name))) ":")
-            (not (== (.indexOf token "::" 1) -1)))
-      (reader-error! "Invalid token: " token)
-      (if (and (not (nil? ns)) (> (.-length ns) 0))
-        (keyword (.substring ns 0 (.indexOf ns "/")) name)
-        (keyword token)))))
+        auto (identical? "::" (aget a 1))
+        ns (aget a 2)
+        kwname (aget a 3)
+        ns (if auto
+             (name
+               (if ns
+                 (or (resolve-ns ns) (reader-error! "Unknown namespace alias: " ns))
+                 (ns-name *ns*)))
+             ns)]
+    (keyword ns kwname)))
 
 (defn read-keyword [rdr a _]
-  (read-tokenized rdr a "" as-keyword))
+  (read-tokenized rdr a ":" as-keyword))
 
 (defn read-num-escape [^not-native rdr len base n sb]
   (if (pos? len)
@@ -444,16 +471,22 @@
     (> (.-length a) upto) (reader-error! "Reader bug: read too many forms.")
     :else true))
 
+(defn read1 [rdr a]
+  (readN rdr a (inc (.-length a))))
+
+(defn read2 [rdr a]
+  (readN rdr a (+ 2 (.-length a))))
+
 (defn read-wrap [sym]
   (fn [rdr a _]
-    (if (readN rdr a (inc (.-length a)))
+    (if (read1 rdr a)
       (do (.push a (list sym (.pop a))) true)
       (on-ready rdr #(do (check %) (.push a (list sym (.pop a))) true)))))
 
-(defn read-null [rdr a _]
-  (if (readN rdr a (inc (.-length a)))
+(defn read-discard [rdr a _]
+  (if (bound-read [*suppress-read* true] (read1 rdr a))
     (do (.pop a) true)
-    (on-ready rdr #(do (check %) (.pop a) true))))
+    (on-ready rdr #(do (.pop a) true))))
 
 (defn- fold-meta [a]
   (let [v (.pop a)
@@ -467,7 +500,7 @@
     true))
 
 (defn read-meta [rdr a _]
-  (if (readN rdr a (+ 2 (.-length a)))
+  (if (read2 rdr a)
     (fold-meta a)
     (on-ready rdr #(do (check %) (fold-meta a)))))
 
@@ -475,8 +508,10 @@
   (let [end-line (.-line rdr)
         end-col (.-col rdr)
         v (.pop a)]
-    (when-not (or (boolean? v) (nil? v)) ; as read-symbol may push them
-      (.push a (vary-meta v merge {:line line :column col :end-line end-line :end-column end-col})))
+    (.push a
+      (if (or (boolean? v) (nil? v)) ; as read-symbol may push them
+        v
+        (vary-meta v merge {:line line :column col :end-line end-line :end-column end-col})))
     true))
 
 (defn with-line+col
@@ -491,8 +526,219 @@
             (on-ready rdr #(do (check %) (tag-line+col % a line col)))))
         (r rdr a ch)))))
 
-(def ^:dynamic *dispatch-macros* #js [])
-(def ^:dynamic *default-dispatch-macro* #(str "No dispatch macro for #" %3))
+(defn preserve-read-cond? []
+  (and *reading-cond* (= :preserve *read-cond-mode*)))
+
+(defn- fold-ctor [a]
+  (let [form (.pop a)
+        tag (.pop a)]
+    (when-not (symbol? tag)
+      (reader-error! "Reader tag must be a symbol."))
+    (if (or (preserve-read-cond?) *suppress-read*)
+      (tagged-literal tag form)
+      (if-some [[pre post] (re-matches #"(.*)\.([^.]*)" (name tag))]
+        (do ; map form only
+          (when-not *read-eval*
+            (reader-error! "Record construction syntax can only be used when *read-eval* is true"))
+          (.push a (list (symbol (str pre "/map->" post)) form)))
+        (if-some [f (or (get *data-readers* tag) *default-data-reader-fn*)]
+          (f tag form)
+          (reader-error! "No reader function for tag " tag))))
+    true))
+
+(defn read-ctor [rdr a]
+  (unread rdr)
+  (if (read2 rdr a)
+    (fold-ctor a)
+    (on-ready rdr #(do (check %) (fold-ctor a)))))
+
+(def ^:private reserved-features #{:else :none})
+
+(defn has-feature? [feature]
+  (when-not (keyword? feature)
+    (reader-error! "Feature should be a keyword: " feature))
+  (or (= :default feature) (contains? *read-cond-features* feature)))
+
+(defn read-cond-list [^not-native rdr pa a splicing]
+  (let [ch (read-char rdr)]
+    (cond
+      (nil? ch) (on-ready rdr #(read-cond-list % pa a splicing))
+      (eof? ch) (eof-error!) 
+      (identical? ")" ch) 
+      (case (.-length a)
+        0 true
+        2 (let [form (aget a 1)]
+            (if splicing
+              (if (sequential? form)
+                (.apply js/Array.prototype.push pa form)
+                (reader-error! "Spliced form list in read-cond-splicing must be sequential."))
+              (.push pa form))
+            true)
+        (1 3) (reader-error! "read-cond requires an even number of forms."))
+      :else (do
+              (unread rdr)
+              (case (.-length a)
+                (0 2)
+                (if (read-some rdr a)
+                  (recur rdr pa a splicing)
+                  (on-ready rdr #(read-cond-list % pa a splicing)))
+                1
+                (let [feature (aget a 0)]
+                  (when (reserved-features feature)
+                    (reader-error! "Feature name " feature " is reserved."))
+                  (if (if (has-feature? feature)
+                        (read1 rdr a)
+                        (read-discard rdr (doto a .pop) "_"))
+                    (recur rdr pa a splicing)
+                    (on-ready rdr #(read-cond-list % pa a splicing))))
+                3
+                (if (read-discard rdr a "_")
+                  (recur rdr pa (doto a .pop) splicing)
+                  (on-ready rdr
+                    #(read-cond-list % pa (doto a .pop) splicing))))))))
+
+(defrecord ReaderConditional [form splicing?])
+(defn reader-conditional [form splicing?] (ReaderConditional. form splicing?))
+(defn reader-conditional? [x] (instance? ReaderConditional x))
+
+(defn- fold-reader-conditional [a splicing]
+  (let [form (.pop a)]
+    (when (odd? (count form))
+      (reader-error! "read-cond requires an even number of forms."))
+    (.push a (reader-conditional form splicing))
+    true))
+
+(defn read-cond-body [^not-native rdr a splicing]
+  (let [ch (read-char rdr)]
+    (cond
+      (nil? ch) (on-ready rdr #(read-cond-body % a splicing))
+      (eof? ch) (eof-error!)
+      (identical? "(" ch)
+      (if (preserve-read-cond?)
+        (if (read-list rdr a ch)
+          (fold-reader-conditional a splicing)
+          (on-ready rdr #(do (check %) (fold-reader-conditional a splicing))))
+        (read-cond-list rdr a #js [] splicing))
+      :else (reader-error! "read-cond body must be a list."))))
+
+(defn read-cond [^not-native rdr a _]
+  (when-not (#{:allow :preserve} *read-cond-mode*)
+    (reader-error! "Conditional read not allowed"))
+  (let [ch (read-char rdr)]
+    (cond
+      (nil? ch) (on-ready rdr #(read-cond % a "?"))
+      (eof? ch) (eof-error!)
+      :else
+      (let [splicing (identical? ch "@")]
+        (when-not splicing (unread rdr))
+        (if (skip rdr whitespace?)
+          (bound-read [*reading-cond* true] (read-cond-body rdr a splicing))
+          (on-ready rdr #(bound-read [*reading-cond* true] (read-cond-body % a splicing))))))))
+
+(defn- fold-unquote [a sym]
+  (.push a (list sym (.pop a)))
+  true)
+
+(defn read-unquote [^not-native rdr a _]
+  (let [ch (read-char rdr)]
+    (cond
+      (eof? ch) (eof-error!)
+      (nil? ch) (on-ready rdr #(read-unquote % a nil))
+      :else
+      (let [sym (if (identical? "@" ch)
+                  'clojure.core/unquote-splicing
+                  (do (unread rdr) 'clojure.core/unquote))]
+        (if (read1 rdr a)
+          (fold-unquote a sym)
+          (on-ready rdr #(do (check %) (fold-unquote a sym))))))))
+
+(declare syntax-quote)
+
+(defn- listy? [x] (or (list? x) (seq? x)))
+
+(defn unquote-splicing? [x]
+  (and (listy? x) (= 'clojure.core/unquote-splicing (first x))))
+
+(defn unquote? [x]
+  (and (listy? x) (= 'clojure.core/unquote (first x))))
+
+(defn- unquotable? [x]
+  (or (keyword? x) (number? x) (string? x) (nil? x) (boolean? x)
+    (and (listy? x) (= 'quote (first x)))))
+
+(defn- unquote [x]
+  (if (and (listy? x) (= 'quote (first x)))
+    (second x)
+    x))
+
+(defn- syntax-quote-expand [f fsym xs]
+  (let [chunks #js []
+        chunk #js []
+        spliced (reduce 
+                  (fn [spliced x]
+                    (if (unquote-splicing? x)
+                      (do
+                        (when-not (zero? (.-length chunk))
+                          (.push chunks (vec chunk))
+                          (set! (.-length chunk) 0))
+                        (.push chunks (second x))
+                        true)
+                      (do (.push chunk (syntax-quote x)) spliced)))
+                  false xs)]
+    (when (pos? (.-length chunk))
+      (.push chunks (vec chunk)))
+    (case (.-length chunks)
+      0 (f nil)
+      1 (cond
+          spliced
+         `(apply ~fsym ~(aget chunks 0))
+         (every? unquotable? (aget chunks 0))
+         (list 'quote (f (map unquote (aget chunks 0))))
+         :else
+         `(~fsym ~@(aget chunks 0)))
+      `(apply ~fsym (concat ~@chunks)))))
+
+(def ^:dynamic *autogensym*)
+(def ^:dynamic *resolve*)
+
+(defn- syntax-quote-symbol [sym]
+  (list 'quote
+    (cond
+     (and (nil? (namespace sym)) (.endsWith (name sym) "#")) (*autogensym* sym)
+     (.endsWith (name sym) ".")
+     (let [sym (*resolve* (symbol (namespace sym) (subs (name sym) 0 (dec (count (name sym))))))]
+       (symbol (namespace sym) (str (name sym) ".")))
+     (and (nil? (namespace sym)) (.startsWith (name sym) ".")) sym
+     :else (*resolve* sym))))
+
+(defn- syntax-quote [x]
+  (cond
+    (special-symbol? x) (list 'quote x)
+    (symbol? x) (syntax-quote-symbol x)
+    (or (keyword? x) (number? x) (string? x) (nil? x) (boolean? x)) x
+    (unquote? x) (second x)
+    (unquote-splicing? x) (reader-error! "splice not in list")
+    (record? x) x
+    (map? x) (syntax-quote-expand map* `hash-map (mapcat seq x))
+    (vector? x) (syntax-quote-expand vec `vector x)
+    (set? x) (syntax-quote-expand set `hash-set x)
+    (listy? x) (syntax-quote-expand sequence `list x)
+    (coll? x) (reader-error! "Unknown Collection type")
+    :else  (list 'quote x)))
+
+(defn- autogensym [sym]
+  (symbol (str (name (gensym (str (subs (name sym) 0 (dec (count (name sym))))
+                               "__"))) "__auto__")))
+
+(defn- fold-syntax-quote [a]
+  (.push a (binding [*autogensym* (memoize autogensym)]
+             (syntax-quote (.pop a))))
+  true)
+
+(defn read-syntax-quote [^not-native rdr a _]
+  (if (read1 rdr a)
+    (fold-syntax-quote a)
+    (on-ready rdr #(do (check %) (fold-syntax-quote a)))))
 
 (defn read-dispatch [^not-native rdr a _]
   (let [ch (read-char rdr)]
@@ -554,7 +800,7 @@
     (cond
       (= '& t) (register-arg! a -1)
       (number? t) (register-arg! a (int t))
-      :else (reader-error "arg literal must be %, %& or %number"))))
+      :else (reader-error! "arg literal must be %, %& or %number"))))
 
 (defn read-arg [rdr a ch]
   (if *arg-env*
@@ -582,12 +828,74 @@
 
 (defn read-fn [rdr a ch]
   (when *arg-env*
-    (reader-error "Nested #()s are not allowed."))
+    (reader-error! "Nested #()s are not allowed."))
   (set! *arg-env* (sorted-map))
   (read-delimited rdr a ")" anon-fn #js []))
 
+(defn read-unreadable [rdr a ch]
+  (reader-error! "Unreadable form."))
+
+(defn- fold-namespaced-map [a auto]
+  (let [m (.pop a)
+        tag (if (= :current-ns auto)
+              (ns-name *ns*)
+              (.pop a))
+        auto( if (= :current-ns auto) false auto)]
+    (prn '>>> tag m)
+    (when-not (map? m)
+      (reader-error! "Namespaced map must specify a map"))
+    (when-not (simple-symbol? tag)
+      (reader-error! "Namespaced map must specify a valid namespace: " tag))
+    (if-some [ns (some-> (if auto (resolve-ns tag) tag) name)]
+      (let [m (persistent!
+                (reduce-kv (fn [m k v]
+                             (assoc! m
+                               (cond
+                                 (symbol? k)
+                                 (case (namespace k)
+                                   nil (symbol ns (name k))
+                                   "_" (symbol nil (name k))
+                                   k)
+                                 (keyword? k)
+                                 (case (namespace k)
+                                   nil (keyword ns (name k))
+                                   "_" (keyword nil (name k))
+                                   k)
+                                 :else k)
+                               v)) (transient {}) m))]
+        (.push a m)
+        true)
+      (reader-error! "Unknown auto-resolved namespace alias: " tag))))
+
+(defn read-namespaced-map-tag [^not-native rdr a auto]
+  (let [ch (read-char rdr)]
+    (cond
+      (eof? ch) (eof-error!)
+      (nil? ch) (on-ready rdr #(read-namespaced-map-tag % a auto))
+      (or (whitespace? ch) (identical? "{" ch))
+      ; TODO; read1 and read2 are more liberal than LispReader because they allow any kinf of form evaluating to a map
+      ; use read-delimited instead
+      (if auto
+        (if (read1 (doto rdr unread) a)
+          (fold-namespaced-map a :current-ns)
+          (on-ready rdr #(do (check %) (fold-namespaced-map a :current-ns))))
+        (reader-error! "Namespaced map must specify a namespace"))
+      (read2 (doto rdr unread) a) (fold-namespaced-map a auto)
+      :else
+      (on-ready rdr #(do (check %) (fold-namespaced-map a auto))))))
+
+(defn read-namespaced-map [^not-native rdr a ch]
+  (let [ch (read-char rdr)]
+    (cond
+      (eof? ch) (eof-error!)
+      (nil? ch) (on-ready rdr #(read-namespaced-map % a ":"))
+      :else
+      (let [auto (identical? ":" ch)]
+        (when-not auto (unread rdr))
+        (read-namespaced-map-tag rdr a auto)))))
+
 ;; root readers
-(defn- read1 [a root-cb read-some]
+(defn- read1-top [a root-cb read-some]
   (let [ex (volatile! nil)]
     (fn self [^not-native rdr]
       (let [r (or (pos? (alength a)) (try (read-some rdr a) (catch :default e (vreset! ex e))))]
@@ -603,32 +911,39 @@
     a))
 
 (def cljs-dispatch-macros
-  {"{" (with-line+col read-set 2)
-   "_" read-null
-   "^" (with-line+col read-meta 2)
+  {"^" (with-line+col read-meta 2)
+   "'" (with-line+col (read-wrap 'var) 2)
    "\"" read-regex
+   "(" read-fn
+   "{" (with-line+col read-set 2)
+   "=" (fn [_ _ _] (reader-error! "read-eval is not supported.")) ; read-eval
    "!" read-comment
-   "(" read-fn})
+   "<" read-unreadable
+   "_" read-discard
+   "?" read-cond
+   ":" read-namespaced-map})
 
 (def cljs-macros
   (->
     {"\"" read-stringlit 
-     ":" read-keyword
      ";" read-comment
-     "(" (with-line+col read-list)
-     "[" (with-line+col read-vector)
-     "{" (with-line+col read-map)
-     "}" read-unbalanced
-     "]" read-unbalanced
-     ")" read-unbalanced
-     "\\" read-charlit
-     "#" read-dispatch
-     "^" (with-line+col read-meta 1)
-     "+" read-sym-or-num
-     "-" read-sym-or-num
      "'" (with-line+col (read-wrap 'quote))
      "@" (with-line+col (read-wrap 'deref))
-     "%" read-arg}
+     "^" (with-line+col read-meta)
+     "`" read-syntax-quote
+     "~" read-unquote
+     "(" (with-line+col read-list)
+     ")" read-unbalanced
+     "[" (with-line+col read-vector)
+     "]" read-unbalanced
+     "{" (with-line+col read-map)
+     "}" read-unbalanced
+     "\\" read-charlit
+     "%" read-arg
+     "#" read-dispatch
+     ":" read-keyword
+     "+" read-sym-or-num
+     "-" read-sym-or-num}
     (into (map vector "0123456789" (repeat read-number)))
     (into (map vector "\t\n\r ," (repeat read-space)))))
 
@@ -637,44 +952,56 @@
 
 (def ^:private default-read-opts
   {:eof :eofthrow
-   :macros (macros-table cljs-macros)
-   :default-macro (with-line+col read-symbol)
-   :terminating-macros (macros-table cljs-terminating-macros)
-   :dispatch-macros (macros-table cljs-dispatch-macros)
-   :default-dispatch-macro #(str "No dispatch macro for #" %3)})
+   :read-cond :allow
+   :features #{:cljs}
+   ::resolve ana/resolve-symbol
+   ::macros (macros-table cljs-macros)
+   ::default-macro (with-line+col read-symbol)
+   ::terminating-macros (macros-table cljs-terminating-macros)
+   ::dispatch-macros (macros-table cljs-dispatch-macros)
+   ::default-dispatch-macro read-ctor
+   ::read-eval false})
 
 (defn read
   "Like usual read but takes an additional last argument: a callback.
    The callback takes two arguments value and error. It will be called when a value is read or
    an error thrown."
-  ([cb] (read *in* cb))
+  ([cb] (read {} *in* cb))
   ([rdr cb]
-    (read rdr cb true nil))
+    (read {} rdr cb))
   ([opts rdr cb]
-    (let [{:keys [eof macros default-macro terminating-macros dispatch-macros default-dispatch-macro]} (into default-read-opts opts)]
-      (dyn/binding [*macros* macros
+    (let [{:keys [eof read-cond features
+                  ::macros ::default-macro ::terminating-macros
+                  ::dispatch-macros ::default-dispatch-macro
+                  ::resolve ::read-eval]}
+          (into default-read-opts opts)]
+      (dyn/binding [*read-cond-mode* read-cond
+                    *read-cond-features* features
+                    *macros* macros
                     *default-macro* default-macro
                     *terminating-macros* terminating-macros
                     *dispatch-macros* dispatch-macros
                     *default-dispatch-macro* default-dispatch-macro
                     *error-data* #(-info rdr)
-                    *arg-env* nil]
-        (on-ready rdr (read1 #js [] cb (if (= :eofthrow eof) read-some (safe-read-some eof)))))))
+                    *arg-env* nil
+                    *resolve* resolve
+                    *read-eval* read-eval]
+        (on-ready rdr (read1-top #js [] cb (if (= :eofthrow eof) read-some (safe-read-some eof)))))))
   ([rdr cb eof-error? eof-value]
     (read {:eof (if eof-error? :eof-throw eof-value)} rdr cb)))
 
 (defn read-string
-  ([s]
+  ([s] (read-string {} s))
+  ([opts s]
     (let [{:keys [in print-fn]} (create-pipe)
           in (line-col-reader in)
           ret #js [nil nil]]
       (print-fn s)
       (print-fn)
-      (read in (fn [v ex] (doto ret (aset 0 v) (aset 1 ex))))
+      (read opts in (fn [v ex] (doto ret (aset 0 v) (aset 1 ex))))
       (if-some [ex (aget ret 1)]
         (throw ex)
-        (aget ret 0))))
-  ([opts s]))
+        (aget ret 0)))))
 
 (defn with-string [s f]
   (let [{:keys [in print-fn]} (create-pipe)
