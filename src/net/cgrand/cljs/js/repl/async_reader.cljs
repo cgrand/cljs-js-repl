@@ -6,10 +6,15 @@
   (:require-macros [net.cgrand.cljs.js.repl.async-reader :refer [bound-read]]))
   
 (defprotocol AsyncPushbackReader
-  (read-char [rdr])
-  (unread [rdr])
-  (-on-ready [rdr toprdr f])
-  (-info [rdr]))
+  "Protocol for asynchronous character streams."
+  (read-char [rdr]
+    "Returns either a character, nil (no more data at the moment), eof (false)")
+  (unread [rdr]
+    "Unreads the last read character, can only be called once and after a successful read-char (no nil no eof)")
+  (-on-ready [rdr toprdr f]
+    "When data is available, call f with argument toprdr.")
+  (-info [rdr]
+    "Return a map about the state of the reader."))
 
 (defn on-ready
   "f is a function of two arguments: an async reader and an array where to push values.

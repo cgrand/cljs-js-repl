@@ -5,7 +5,7 @@ An effort to make self-hosted cljs repls upgradeable.
 To achieve this goal some subgoals must be met:
 
  * input stream abstraction (done)
- * async reader (partially done)
+ * async reader (done)
  * dynamic binding conveyance (done)
  * expose `eval`
 
