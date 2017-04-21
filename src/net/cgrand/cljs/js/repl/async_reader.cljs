@@ -835,54 +835,57 @@
 (defn read-unreadable [rdr a ch]
   (reader-error! "Unreadable form."))
 
-(defn- fold-namespaced-map [a auto]
-  (let [m (.pop a)
-        tag (if (= :current-ns auto)
-              (ns-name *ns*)
-              (.pop a))
-        auto( if (= :current-ns auto) false auto)]
-    (prn '>>> tag m)
-    (when-not (map? m)
-      (reader-error! "Namespaced map must specify a map"))
-    (when-not (simple-symbol? tag)
-      (reader-error! "Namespaced map must specify a valid namespace: " tag))
-    (if-some [ns (some-> (if auto (resolve-ns tag) tag) name)]
-      (let [m (persistent!
-                (reduce-kv (fn [m k v]
-                             (assoc! m
-                               (cond
-                                 (symbol? k)
-                                 (case (namespace k)
-                                   nil (symbol ns (name k))
-                                   "_" (symbol nil (name k))
-                                   k)
-                                 (keyword? k)
-                                 (case (namespace k)
-                                   nil (keyword ns (name k))
-                                   "_" (keyword nil (name k))
-                                   k)
-                                 :else k)
-                               v)) (transient {}) m))]
-        (.push a m)
-        true)
-      (reader-error! "Unknown auto-resolved namespace alias: " tag))))
+(defn- ns-map* [ns kvs]
+  (loop [i 0]
+    (when (< i (.-length kvs))
+      (let [k (aget kvs i)]
+        (aset kvs i
+          (cond
+            (symbol? k)
+            (case (namespace k)
+              nil (symbol ns (name k))
+              "_" (symbol nil (name k))
+              k)
+            (keyword? k)
+            (case (namespace k)
+              nil (keyword ns (name k))
+              "_" (keyword nil (name k))
+              k)
+            :else k))
+        (recur (+ 2 i)))))
+  (map* kvs))
 
-(defn read-namespaced-map-tag [^not-native rdr a auto]
+(defn- read-namespaced-map-map [^not-native rdr a auto]
   (let [ch (read-char rdr)]
     (cond
       (eof? ch) (eof-error!)
-      (nil? ch) (on-ready rdr #(read-namespaced-map-tag % a auto))
+      (nil? ch) (on-ready rdr #(read-namespaced-map-map % a auto))
+      (whitespace? ch) (if (skip rdr whitespace?)
+                         (recur rdr a auto)
+                         (on-ready rdr #(read-namespaced-map-map % a auto)))
+      (not (identical? "{" ch)) (reader-error! "Namespaced map must specify a map")
+      :else 
+      (let [tag (.pop a)]
+        (when-not (simple-symbol? tag)
+          (reader-error! "Namespaced map must specify a valid namespace: " tag))
+        (if-some [ns (some-> (if auto (resolve-ns tag) tag) name)]
+          (read-delimited rdr a "}" #(ns-map* ns %) #js [])
+          (reader-error! "Unknown auto-resolved namespace alias: " tag))))))
+
+(defn- read-namespaced-map-ns [^not-native rdr a auto]
+  (let [ch (read-char rdr)]
+    (cond
+      (eof? ch) (eof-error!)
+      (nil? ch) (on-ready rdr #(read-namespaced-map-ns % a auto))
       (or (whitespace? ch) (identical? "{" ch))
       ; TODO; read1 and read2 are more liberal than LispReader because they allow any kinf of form evaluating to a map
       ; use read-delimited instead
       (if auto
-        (if (read1 (doto rdr unread) a)
-          (fold-namespaced-map a :current-ns)
-          (on-ready rdr #(do (check %) (fold-namespaced-map a :current-ns))))
+        (read-namespaced-map-map (doto rdr unread) (doto a (.push (ns-name *ns*))) false)
         (reader-error! "Namespaced map must specify a namespace"))
-      (read2 (doto rdr unread) a) (fold-namespaced-map a auto)
+      (read1 (doto rdr unread) a) (read-namespaced-map-map rdr a auto)
       :else
-      (on-ready rdr #(do (check %) (fold-namespaced-map a auto))))))
+      (on-ready rdr #(read-namespaced-map-map % a auto)))))
 
 (defn read-namespaced-map [^not-native rdr a ch]
   (let [ch (read-char rdr)]
@@ -892,7 +895,7 @@
       :else
       (let [auto (identical? ":" ch)]
         (when-not auto (unread rdr))
-        (read-namespaced-map-tag rdr a auto)))))
+        (read-namespaced-map-ns rdr a auto)))))
 
 ;; root readers
 (defn- read1-top [a root-cb read-some]
