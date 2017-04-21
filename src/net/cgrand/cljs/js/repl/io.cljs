@@ -30,6 +30,7 @@
       :else (do (unread rdr) true))))
 
 (deftype LineColNumberingReader [^not-native prdr ^:mutable col ^:mutable pcol ^:mutable line]
+  ; In addition to keeping tack of line/column, it collapses CR, LF, and CRLF into a single \newline.
   AsyncPushbackReader
   (read-char [rdr]
     (let [ch (read-char prdr)]
@@ -89,7 +90,7 @@
   true)
 
 (deftype Pipe [^:mutable running ^:mutable s ^:mutable idx ^:mutable cb+rdrs ^:mutable sentinel
-               ^:mutable bindings]
+               ^:mutable bindings waiting-cbs+readers+envs]
   AsyncPushbackReader
   (read-char [_]
     (if-some [ch (aget s idx)]
@@ -102,32 +103,40 @@
   (-on-ready [_ rdr cb]
     (if running
       (when cb (.push cb+rdrs cb) (.push cb+rdrs rdr))
-      (do ; not running
-        (when cb
-          (when (pos? (.-length cb+rdrs))
-            (throw (js/Error. "This reader has already one consumer.")))
-          (.push cb+rdrs cb)
-          (.push cb+rdrs rdr))
-        (dyn/with-bindings bindings
-          (set! running true)
-          (let [conts cb+rdrs]
-            (set! cb+rdrs #js [0 0])
-            (loop [erdr nil]
-              (when-some [cont (.shift conts)]
-                (let [rdr (.shift conts)
-                      r (try (boolean (cont (or erdr rdr)))
-                          (catch :default e
-                            (set! (.-length cb+rdrs) 2)
-                            (FailingReader. e)))]
-                  (cond
-                    (true? r) (recur nil)
-                    r (recur r)))))
-            (.apply js/Array.prototype.splice conts cb+rdrs)
-            (set! cb+rdrs conts)
-            (set! bindings (when (pos? (.-length cb+rdrs))
-                             (dyn/get-binding-env)))
-            (set! running false)))))
-    nil)
+      ; not running
+      (let [should-run (if (nil? cb) (pos? (.-length cb+rdrs)) (zero? (.-length cb+rdrs)))] 
+        (if should-run
+          (dyn/with-bindings bindings
+            (when cb
+              (.push cb+rdrs cb)
+              (.push cb+rdrs rdr))
+            (set! running true)
+            (let [conts cb+rdrs]
+              (set! cb+rdrs #js [0 0])
+              (loop [erdr nil]
+                (when-some [cont (.shift conts)]
+                  (let [rdr (.shift conts)
+                        r (try (boolean (cont (or erdr rdr)))
+                            (catch :default e
+                              (set! (.-length cb+rdrs) 2)
+                              (FailingReader. e)))]
+                    (cond
+                      (true? r) (recur nil)
+                      r (recur r)))))
+              (.apply js/Array.prototype.splice conts cb+rdrs)
+              (set! cb+rdrs conts)
+              (set! bindings (when (pos? (.-length cb+rdrs))
+                               (dyn/get-binding-env)))
+              (set! running false)))
+          ; should not run
+          (when cb (.push waiting-cbs+readers+envs cb rdr (dyn/get-binding-env))))))
+    (if (and (zero? (.-length cb+rdrs)) (pos? (.-length waiting-cbs+readers+envs)))
+      (do
+        (.push cb+rdrs (.shift waiting-cbs+readers+envs)) ; cb
+        (.push cb+rdrs (.shift waiting-cbs+readers+envs)) ; rdr
+        (set! bindings (.shift waiting-cbs+readers+envs)) ; bindings
+        (recur nil nil nil))
+      (zero? (.-length cb+rdrs)))) ; returns true when all clear
   IFn
   (-invoke [rdr] ; EOF
     (set! sentinel false))
@@ -142,11 +151,19 @@
   The :in value is an async reader suitable to use as *in* or to pass to read.
   The :print-fn is a fn suitable as *print-fn*. It supports a 0-arity to close the pipe."
   []
-  (let [pipe (Pipe. false "" 0 #js [] nil nil)]
+  (let [pipe (Pipe. false "" 0 #js [] nil nil #js [])]
     {:print-fn (fn
                  ([] (pipe) (on-ready pipe nil))
                  ([s] (pipe s) (on-ready pipe nil)))
      :in pipe}))
+
+(defn skip [^not-native rdr pred]
+  (let [ch (read-char rdr)]
+    (cond
+      (pred ch) (recur rdr pred)
+      (eof? ch) true
+      (nil? ch) (on-ready rdr #(skip % pred))
+      :else (do (unread rdr) true))))
 
 (def ^:dynamic *in* "A reader implementing AsyncPushbackReader."
   (FailingReader. (js/Error. "No *in* reader set.")))

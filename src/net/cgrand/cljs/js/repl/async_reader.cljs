@@ -1,6 +1,6 @@
 (ns net.cgrand.cljs.js.repl.async-reader
   (:require [goog.string :as gstring]
-    [net.cgrand.cljs.js.repl.io :as io :refer [read-char unread on-ready eof? check]]
+    [net.cgrand.cljs.js.repl.io :as io :refer [read-char unread on-ready eof? check skip]]
     [net.cgrand.cljs.js.repl.dynvars :as dyn]
     [cljs.analyzer :as ana]
     [cljs.env :as env]))  
@@ -33,14 +33,6 @@
   (reader-error! "EOF while reading."))
 
 (declare read-some macros ^boolean terminating-macros)
-
-(defn skip [^not-native rdr pred]
-  (let [ch (read-char rdr)]
-    (cond
-      (pred ch) (recur rdr pred)
-      (eof? ch) true
-      (nil? ch) (on-ready rdr #(skip % pred))
-      :else (do (unread rdr) true))))
 
 (defn- ^boolean whitespace?
   "Checks whether a given character is whitespace"
