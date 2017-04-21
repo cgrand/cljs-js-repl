@@ -170,6 +170,9 @@
 
 (def ^:dynamic *read-cond-features* #{})
 
+(def ^:dynamic *autogensym*)
+(def ^:dynamic *resolve* "A two function args (first arg bieing either :ns or :symbol) to perform resolution")
+
 ;; readers
 (defn reader-error! [& msg]
   (throw 
@@ -386,11 +389,9 @@
 (defn read-unbalanced [rdr a ch]
   (reader-error! "Unmatched delimiter " ch))
 
-(defn resolve-ns [alias-or-nsname]
-  (let [alias-or-nsname (if (string? alias-or-nsname) (symbol alias-or-nsname) alias-or-nsname)]
-    (if (ana/get-namespace alias-or-nsname)
-      alias-or-nsname
-      (ana/resolve-ns-alias (assoc @env/*compiler* :ns (ana/get-namespace ana/*cljs-ns*)) alias-or-nsname nil))))
+(defn resolve-ns [x] (*resolve* :ns x))
+
+(defn resolve-symbol [x] (*resolve* :symbol x))
 
 (defn as-keyword [token]
   (let [a (re-matches* symbol-pattern token)
@@ -703,18 +704,15 @@
          `(~fsym ~@(aget chunks 0)))
       `(apply ~fsym (concat ~@chunks)))))
 
-(def ^:dynamic *autogensym*)
-(def ^:dynamic *resolve*)
-
 (defn- syntax-quote-symbol [sym]
   (list 'quote
     (cond
      (and (nil? (namespace sym)) (.endsWith (name sym) "#")) (*autogensym* sym)
      (.endsWith (name sym) ".")
-     (let [sym (*resolve* (symbol (namespace sym) (subs (name sym) 0 (dec (count (name sym))))))]
+     (let [sym (resolve-symbol (symbol (namespace sym) (subs (name sym) 0 (dec (count (name sym))))))]
        (symbol (namespace sym) (str (name sym) ".")))
      (and (nil? (namespace sym)) (.startsWith (name sym) ".")) sym
-     :else (*resolve* sym))))
+     :else (resolve-symbol sym))))
 
 (defn- syntax-quote [x]
   (cond
@@ -903,15 +901,6 @@
         (read-namespaced-map-ns rdr a auto)))))
 
 ;; root readers
-(defn- read1-top [a root-cb read-some]
-  (let [ex (volatile! nil)]
-    (fn self [^not-native rdr]
-      (let [r (or (pos? (alength a)) (try (read-some rdr a) (catch :default e (vreset! ex e))))]
-        (cond
-          @ex (do (root-cb nil @ex) true)
-          (pos? (alength a)) (do (root-cb (aget a 0) nil) true)
-          :else (on-ready rdr self))))))
-
 (defn macros-table [m]
   (let [a (object-array 128)]
     (doseq [[ch f] m]
@@ -958,17 +947,34 @@
 (def cljs-terminating-macros
   (reduce dissoc cljs-macros ":+-0123456789#'%"))
 
-(def ^:private default-read-opts
+(defn cljs-resolve [type x]
+  (case type
+    :symbol (ana/resolve-symbol x)
+    :ns (let [alias-or-nsname (if (string? x) (symbol x) x)]
+          (if (ana/get-namespace alias-or-nsname)
+            alias-or-nsname
+            (ana/resolve-ns-alias (assoc @env/*compiler* :ns (ana/get-namespace ana/*cljs-ns*)) alias-or-nsname nil)))))
+
+(def ^:private cljs-read-opts
   {:eof :eofthrow
    :read-cond :allow
    :features #{:cljs}
-   ::resolve ana/resolve-symbol
+   ::resolve cljs-resolve
    ::macros (macros-table cljs-macros)
    ::default-macro (with-line+col read-symbol)
    ::terminating-macros (macros-table cljs-terminating-macros)
    ::dispatch-macros (macros-table cljs-dispatch-macros)
    ::default-dispatch-macro read-ctor
    ::read-eval false})
+
+(defn- read1-top [a root-cb read-some]
+  (let [ex (volatile! nil)]
+    (fn self [^not-native rdr]
+      (let [r (or (pos? (alength a)) (try (read-some rdr a) (catch :default e (vreset! ex e))))]
+        (cond
+          @ex (do (root-cb nil @ex) true)
+          (pos? (alength a)) (do (root-cb (aget a 0) nil) true)
+          :else (on-ready rdr self))))))
 
 (defn read
   "Like usual read but takes an additional last argument: a callback.
@@ -982,7 +988,7 @@
                   ::macros ::default-macro ::terminating-macros
                   ::dispatch-macros ::default-dispatch-macro
                   ::resolve ::read-eval]}
-          (into default-read-opts opts)]
+          (into cljs-read-opts opts)]
       (dyn/binding [*read-cond-mode* read-cond
                     *read-cond-features* features
                     *macros* macros
@@ -1011,54 +1017,75 @@
         (throw ex)
         (aget ret 0)))))
 
-(defn with-string [s f]
-  (let [{:keys [in print-fn]} (create-pipe)
-        ret #js [nil nil]]
-    (print-fn s)
-    (print-fn)
-    (on-ready in f)))
+;; EDN
 
-(comment
-  (let [{:keys [in] write :print-fn} (r/create-pipe)] 
-    (write "(12(:fo")
-    (r/read in (partial prn '>))
-    
-    (write "o))]32")))
+(def edn-dispatch-macros
+  {"{" (with-line+col read-set 2)
+   "_" read-discard
+   ":" read-namespaced-map}) ; not really part of edn, left in the name of Postel's loww
 
+(defn- unsupported [msg]
+  (fn [_ _ _]
+    (reader-error! msg)))
 
-(comment
+(def edn-macros
+  (->
+    {"\"" read-stringlit 
+     ";" read-comment
+     "'" (unsupported "No quote in EDN")
+     "@" (unsupported "No deref in EDN")
+     "^" (unsupported "No meta in EDN")
+     "`" (unsupported "No syntax quote in EDN")
+     "~" (unsupported "No unquote in EDN")
+     "(" (with-line+col read-list)
+     ")" read-unbalanced
+     "[" (with-line+col read-vector)
+     "]" read-unbalanced
+     "{" (with-line+col read-map)
+     "}" read-unbalanced
+     "\\" read-charlit
+     "#" read-dispatch
+     ":" read-keyword
+     "+" read-sym-or-num
+     "-" read-sym-or-num}
+    (into (map vector "0123456789" (repeat read-number)))
+    (into (map vector "\t\n\r ," (repeat read-space)))))
 
-  (def repl
-    (letfn [(rep []
-              (println (str (ns-name *ns*)) "=>")
-              (read (fn [form ex]
-                      (if ex
-                        (caught ex)
-                        (eval form
-                          (fn [val ex]
-                            (if ex
-                              (caught ex)
-                              (do
-                                (prn val)
-                                (rep)))))))))
-            (caught [ex]
-              (binding [*print-fn* *print-err-fn*]
-                (prn ex)))]
-      rep))
-  
-   
-              (defn repl-template [prompt read eval print caught]
-                (prompt)
-                (read
-                  (fn self [form e]
-                    (try
-                      (if e (throw e) (print (eval form)))
-                      (catch :default e
-                        (caught e)))
-                    (prompt)
-                    (read self))))
-  
-              (def repl (repl-template #(println (str (ns-name *ns*) "=>"))
-                          read eval prn #(binding [*print-fn* *print-err-fn*] (prn %))))
-  
-)
+(def edn-terminating-macros
+  (reduce dissoc cljs-macros ":+-0123456789#'%"))
+
+(def ^:private edn-read-opts
+  {:eof :eofthrow
+   :read-cond nil ; the dispatch macro isn't ther anyway
+   ::resolve (fn [_ _] (reader-error! "Aliases are not allowed in EDN."))
+   ::macros (macros-table edn-macros)
+   ::default-macro (with-line+col read-symbol)
+   ::terminating-macros (macros-table edn-terminating-macros)
+   ::dispatch-macros (macros-table edn-dispatch-macros)
+   ::default-dispatch-macro read-ctor
+   ::read-eval false})
+
+(defn edn-read
+  "Like usual read but takes an additional last argument: a callback.
+   The callback takes two arguments value and error. It will be called when a value is read or
+   an error thrown."
+  ([cb] (edn-read {} *in* cb))
+  ([rdr cb]
+    (edn-read {} rdr cb))
+  ([opts rdr cb]
+    (read (into edn-read-opts opts) rdr cb))
+  ([rdr cb eof-error? eof-value]
+    (edn-read {:eof (if eof-error? :eof-throw eof-value)} rdr cb)))
+
+(defn edn-read-string
+  ([s] (edn-read-string {} s))
+  ([opts s]
+    (let [{:keys [in print-fn]} (create-pipe)
+          in (line-col-reader in)
+          ret #js [nil nil]]
+      (print-fn s)
+      (print-fn)
+      (edn-read opts in (fn [v ex] (doto ret (aset 0 v) (aset 1 ex))))
+      (if-some [ex (aget ret 1)]
+        (throw ex)
+        (aget ret 0)))))

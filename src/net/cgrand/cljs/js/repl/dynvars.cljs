@@ -19,7 +19,7 @@
         a #js []]
     (transduce (map-indexed (fn [i ^not-native dv] (aset a i @dv)))
       (constantly nil) bound-dynvars)
-    (.push a bound-dynvars)))
+    (doto a (.push bound-dynvars))))
 
 (defn- restore-snapshot! [a]
   (let [bound-dynvars (aget a (dec (.-length a)))] ; no pop because destructive
