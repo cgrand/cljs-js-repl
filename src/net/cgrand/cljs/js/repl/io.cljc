@@ -1,4 +1,4 @@
-(ns net.cgrand.cljs.js.repl.async-reader
+(ns net.cgrand.cljs.js.repl.io
   (:require [net.cgrand.cljs.js.repl.dynvars :as dyn]))
 
 (defmacro bound-read [bindings [f rdr & args]]
