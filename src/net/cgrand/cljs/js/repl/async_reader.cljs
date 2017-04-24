@@ -850,7 +850,7 @@
 (defn read-string
   ([s] (read-string {} s))
   ([opts s]
-    (let [{:keys [in print-fn]} (io/create-pipe)
+    (let [{:keys [in print-fn]} (io/pipe)
           in (io/line-col-reader in)
           ret #js [nil nil]]
       (print-fn s)
@@ -923,7 +923,7 @@
 (defn edn-read-string
   ([s] (edn-read-string {} s))
   ([opts s]
-    (let [{:keys [in print-fn]} (io/create-pipe)
+    (let [{:keys [in print-fn]} (io/pipe)
           in (io/line-col-reader in)
           ret #js [nil nil]]
       (print-fn s)

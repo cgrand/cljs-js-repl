@@ -104,12 +104,20 @@
     (if running
       (when cb (.push cb+rdrs cb) (.push cb+rdrs rdr))
       ; not running
-      (let [should-run (if (nil? cb) (pos? (.-length cb+rdrs)) (zero? (.-length cb+rdrs)))] 
-        (if should-run
+      (do
+        ; any callback registred while "not running" is a new root callback and
+        ; should be enqueued
+        (when cb
+          (.push waiting-cbs+readers+envs cb rdr (dyn/get-binding-env)))
+        ; if nor more active "stack", create one from the queue (if any)
+        (when (and (zero? (.-length cb+rdrs)) (pos? (.-length waiting-cbs+readers+envs)))
+          (.push cb+rdrs (.shift waiting-cbs+readers+envs)) ; cb
+          (.push cb+rdrs (.shift waiting-cbs+readers+envs)) ; rdr
+          (set! bindings (.shift waiting-cbs+readers+envs)))
+        (when (and (pos? (.-length cb+rdrs))
+                (or (< idx (.-length s)) (eof? sentinel)))
+          ; cbs and input, let's go!
           (dyn/with-bindings bindings
-            (when cb
-              (.push cb+rdrs cb)
-              (.push cb+rdrs rdr))
             (set! running true)
             (let [conts cb+rdrs]
               (set! cb+rdrs #js [0 0])
@@ -128,15 +136,10 @@
               (set! bindings (when (pos? (.-length cb+rdrs))
                                (dyn/get-binding-env)))
               (set! running false)))
-          ; should not run
-          (when cb (.push waiting-cbs+readers+envs cb rdr (dyn/get-binding-env))))))
-    (if (and (zero? (.-length cb+rdrs)) (pos? (.-length waiting-cbs+readers+envs)))
-      (do
-        (.push cb+rdrs (.shift waiting-cbs+readers+envs)) ; cb
-        (.push cb+rdrs (.shift waiting-cbs+readers+envs)) ; rdr
-        (set! bindings (.shift waiting-cbs+readers+envs)) ; bindings
-        (recur nil nil nil))
-      (zero? (.-length cb+rdrs)))) ; returns true when all clear
+          (cond
+            (pos? (.-length cb+rdrs)) false ; returns false when pending cbs
+            (pos? (.-length waiting-cbs+readers+envs)) (recur nil nil nil)
+            :else true))))) ; returns true when all clear
   IFn
   (-invoke [rdr] ; EOF
     (set! sentinel false))
@@ -146,7 +149,7 @@
     (set! s (str (subs s idx) s'))
     (set! idx 0)))
 
-(defn create-pipe
+(defn pipe
   "Creates a pipe. Returns a map containing two keys: :in and :print-fn.
   The :in value is an async reader suitable to use as *in* or to pass to read.
   The :print-fn is a fn suitable as *print-fn*. It supports a 0-arity to close the pipe."
