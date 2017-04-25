@@ -35,4 +35,5 @@
   `(let [bindings# (get-binding-env)
          f# (fn ~@fntail)]
      (fn [& args#]
-       (switch-bindings bindings# (apply f# args#)))))
+       (switch-bindings! bindings#)
+       (apply f# args#))))
