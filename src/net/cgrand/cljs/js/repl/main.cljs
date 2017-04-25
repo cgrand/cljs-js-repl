@@ -32,6 +32,7 @@
 (defn- interpret-position [r cb]
   (let [ch (io/read-char r)]
     (cond
+      (nil? ch) (io/on-ready r #(interpret-position % cb))
       (io/eof? ch) (cb :stream-end)
       (identical? \newline ch) (cb :line-start)
       (identical? \; ch)      
@@ -73,7 +74,8 @@
           (fn [input ex]
             (if ex
               (cb nil ex)
-              (skip-if-eol io/*in* (fn [_] (cb input nil))))))))))
+              (cb input nil)
+              #_(skip-if-eol io/*in* (fn [_] (cb input nil))))))))))
 
 (defn repl-caught
   "Default :caught hook for repl"
@@ -127,7 +129,8 @@
        read, eval, or print throws an exception or error
        default: repl-caught"
   [& options]
-  (let [{:keys [init exit need-prompt prompt flush read eval print caught]
+  (let [{:keys [init exit need-prompt prompt flush read #_eval print caught]
+         eval- :eval
          :or {init        #()
               need-prompt (if (instance? io/LineColNumberingReader io/*in*)
                             #(zero? (.-col io/*in*))
@@ -143,8 +146,8 @@
         request-prompt #js {}
         request-exit #js {}]
     (letfn [(caught-ex [e]
-              (caught e)
               (set! *e e)
+              (caught e)
               (prompt-read-eval-print))
             (prompt-read-eval-print []
               (when (need-prompt)
@@ -160,8 +163,8 @@
                       (identical? request-prompt input) (prompt-read-eval-print)
                       (identical? request-exit input) (exit)
                       :else
-                      (eval input
-                        (fn [value e]
+                      (eval- input
+                        (dyn/bound-fn [value e]
                           (if e 
                             (caught-ex e) 
                             (do
@@ -173,6 +176,6 @@
           (catch :default e
             (caught e)
             (set! *e e)))
-      (prompt)
-      (flush)
-      (read-eval-print)))))
+        (prompt)
+        (flush)
+        (read-eval-print)))))
