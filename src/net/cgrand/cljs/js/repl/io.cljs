@@ -130,7 +130,7 @@
                               (FailingReader. e)))]
                     (cond
                       (true? r) (recur nil)
-                      r (recur r)))))
+                      r (recur r))))) ; else (falsey) exit loop
               (.apply js/Array.prototype.splice conts cb+rdrs)
               (set! cb+rdrs conts)
               (set! bindings (when (pos? (.-length cb+rdrs))
@@ -160,12 +160,18 @@
                  ([s] (pipe s) (on-ready pipe nil)))
      :in pipe}))
 
+(defn string-reader [s]
+  (let [pipe (Pipe. false "" 0 #js [] nil nil #js [])]
+    (pipe s)
+    (pipe)
+    pipe))
+
 (defn skip [^not-native rdr pred]
   (let [ch (read-char rdr)]
     (cond
-      (pred ch) (recur rdr pred)
       (eof? ch) true
       (nil? ch) (on-ready rdr #(skip % pred))
+      (pred ch) (recur rdr pred)
       :else (do (unread rdr) true))))
 
 (def ^:dynamic *in* "A reader implementing AsyncPushbackReader."

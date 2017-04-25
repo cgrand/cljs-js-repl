@@ -618,16 +618,6 @@
               (r rdr a ch)
               (reader-error! "Unexpected character: " (pr-str ch))))))
 
-(defn safe-read-some [eof-value]
-  (fn self [^not-native rdr a]
-    (let [ch (read-char rdr)]
-      (cond
-        (eof? ch) (do (.push a eof-value) true)
-        (nil? ch) (on-ready rdr #(self % a))
-        :else (if-some [r (macros ch)]
-                (r rdr a ch)
-                (reader-error! "Unexpected character: " (pr-str ch)))))))
-
 (def ^:dynamic *arg-env* nil)
 
 (defn- gen-arg [n]
@@ -810,14 +800,19 @@
    ::default-dispatch-macro read-ctor
    ::read-eval false})
 
-(defn- read1-top [a root-cb read-some]
-  (let [ex (volatile! nil)]
-    (fn self [^not-native rdr]
-      (let [r (or (pos? (alength a)) (try (read-some rdr a) (catch :default e (vreset! ex e))))]
+(defn readtop [^not-native rdr a eof-value cb]
+  (case (.-length a)
+    0 (let [ch (read-char rdr)]
         (cond
-          @ex (do (root-cb nil @ex) true)
-          (pos? (alength a)) (do (root-cb (aget a 0) nil) true)
-          :else (on-ready rdr self))))))
+          (eof? ch) (do (.push a eof-value) (recur rdr a eof-value cb))
+          (nil? ch) (on-ready rdr #(readtop % a eof-value cb))
+          :else (if-some [r (macros ch)]
+                  (if (r rdr a ch)
+                    (recur rdr a eof-value cb)
+                    (on-ready rdr #(readtop % a eof-value cb)))
+                  (reader-error! "Unexpected character: " (pr-str ch)))))
+    1 (do (try (cb (.pop a)) (catch :default e)) true)
+    (reader-error! "Reader bug: read too many forms.")))
 
 (defn read
   "Like usual read but takes an additional last argument: a callback.
@@ -831,7 +826,8 @@
                   ::macros ::default-macro ::terminating-macros
                   ::dispatch-macros ::default-dispatch-macro
                   ::resolve ::read-eval]}
-          (into cljs-read-opts opts)]
+          (into cljs-read-opts opts)
+          eof (if :eof-throw #js {} eof)]
       (dyn/binding [*read-cond-mode* read-cond
                     *read-cond-features* features
                     *macros* macros
@@ -843,18 +839,18 @@
                     *arg-env* nil
                     *resolve* resolve
                     *read-eval* read-eval]
-        (on-ready rdr (read1-top #js [] cb (if (= :eofthrow eof) read-some (safe-read-some eof)))))))
+        (readtop rdr #js [] eof (fn [v]
+                                  (if (identical? v eof)
+                                    (eof-error!)
+                                    (cb v nil)))))))
   ([rdr cb eof-error? eof-value]
     (read {:eof (if eof-error? :eof-throw eof-value)} rdr cb)))
 
 (defn read-string
   ([s] (read-string {} s))
   ([opts s]
-    (let [{:keys [in print-fn]} (io/pipe)
-          in (io/line-col-reader in)
+    (let [in (-> s io/string-reader io/line-col-reader)
           ret #js [nil nil]]
-      (print-fn s)
-      (print-fn)
       (read opts in (fn [v ex] (doto ret (aset 0 v) (aset 1 ex))))
       (if-some [ex (aget ret 1)]
         (throw ex)
@@ -923,11 +919,8 @@
 (defn edn-read-string
   ([s] (edn-read-string {} s))
   ([opts s]
-    (let [{:keys [in print-fn]} (io/pipe)
-          in (io/line-col-reader in)
+    (let [in (-> s io/string-reader io/line-col-reader)
           ret #js [nil nil]]
-      (print-fn s)
-      (print-fn)
       (edn-read opts in (fn [v ex] (doto ret (aset 0 v) (aset 1 ex))))
       (if-some [ex (aget ret 1)]
         (throw ex)
