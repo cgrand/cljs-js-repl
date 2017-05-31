@@ -35,6 +35,7 @@
   (read-char [rdr]
     (let [ch (read-char prdr)]
       (cond
+        (not ch) ch
         (identical? ch "\r") 
         (do
           (set! line (inc line))
@@ -56,15 +57,15 @@
                 (set! col (inc col))
                 ch))))
   (unread [rdr]
-    (unread prdr)
-    (let [ch (read-char prdr)]
-      (unread prdr)
-      ; assuming that never more than one character is unread
-      (if (or (identical? "\n" ch) (identical? "\r" ch))
-        (do
-          (set! line (dec line))
-          (set! col pcol))
-        (set! col (dec col)))))
+    (unread prdr)#_
+      (let [ch (read-char prdr)]
+       (unread prdr)
+       ; assuming that never more than one character is unread
+       (if (or (identical? "\n" ch) (identical? "\r" ch))
+         (do
+           (set! line (dec line))
+           (set! col pcol))
+         (set! col (dec col)))))
   (-on-ready [_ rdr f]
     (-on-ready prdr rdr f))
   (-info [rdr] (assoc (-info prdr) :line line :column col)))
@@ -102,7 +103,12 @@
   (-info [rdr] {})
   (-on-ready [_ rdr cb]
     (if running
-      (when cb (.push cb+rdrs cb) (.push cb+rdrs rdr))
+      (when cb 
+        (when (= 2 (.-length cb+rdrs)) ; first cb set, sets the bindings
+          (set! bindings (dyn/get-binding-env)))
+        (.push cb+rdrs cb)
+        (.push cb+rdrs rdr)
+        false)
       ; not running
       (do
         ; any callback registred while "not running" is a new root callback and
@@ -124,17 +130,18 @@
               (loop [erdr nil]
                 (when-some [cont (.shift conts)]
                   (let [rdr (.shift conts)
-                        r (try (boolean (cont (or erdr rdr)))
-                            (catch :default e
-                              (set! (.-length cb+rdrs) 2)
-                              (FailingReader. e)))]
+                        erdr (try 
+                               (cont (or erdr rdr))
+                               nil
+                               (catch :default e
+                                 (set! (.-length cb+rdrs) 2)
+                                 (FailingReader. e)))]
                     (cond
-                      (true? r) (recur nil)
-                      r (recur r))))) ; else (falsey) exit loop
+                      erdr (recur erdr) ; wrong: try catch should be on the stack
+                      (= 2 (.-length cb+rdrs)) (recur nil))))) ; else (falsey) exit loop 
               (.apply js/Array.prototype.splice conts cb+rdrs)
               (set! cb+rdrs conts)
-              (set! bindings (when (pos? (.-length cb+rdrs))
-                               (dyn/get-binding-env)))
+              (when (zero? (.-length cb+rdrs)) (set! bindings nil))
               (set! running false)))
           (cond
             (pos? (.-length cb+rdrs)) false ; returns false when pending cbs

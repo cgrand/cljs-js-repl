@@ -166,7 +166,7 @@
                       (eval- input
                         (dyn/bound-fn [value e]
                           (if e 
-                            (caught-ex e) 
+                            (caught-ex e)
                             (do
                               (print value)
                               (prompt-read-eval-print))))))))))]

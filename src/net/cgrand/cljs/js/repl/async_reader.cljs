@@ -597,7 +597,7 @@
 
 (def ^:dynamic *macros* #js [])
 
-(def ^:dynamic *default-macro* #(str "No macro for #" %3))
+(def ^:dynamic *default-macro* #(reader-error! "No macro for #" %3))
 
 (defn macros [ch]
   (or (aget *macros* (.charCodeAt ch 0)) *default-macro*))
@@ -827,7 +827,7 @@
                   ::dispatch-macros ::default-dispatch-macro
                   ::resolve ::read-eval]}
           (into cljs-read-opts opts)
-          eof (if :eof-throw #js {} eof)]
+          eof (if (= eof :eofthrow) #js {} eof)]
       (dyn/binding [*read-cond-mode* read-cond
                     *read-cond-features* features
                     *macros* macros
@@ -844,7 +844,7 @@
                                     (eof-error!)
                                     (cb v nil)))))))
   ([rdr cb eof-error? eof-value]
-    (read {:eof (if eof-error? :eof-throw eof-value)} rdr cb)))
+    (read {:eof (if eof-error? :eofthrow eof-value)} rdr cb)))
 
 (defn read-string
   ([s] (read-string {} s))
@@ -914,7 +914,7 @@
   ([opts rdr cb]
     (read (into edn-read-opts opts) rdr cb))
   ([rdr cb eof-error? eof-value]
-    (edn-read {:eof (if eof-error? :eof-throw eof-value)} rdr cb)))
+    (edn-read {:eof (if eof-error? :eofthrow eof-value)} rdr cb)))
 
 (defn edn-read-string
   ([s] (edn-read-string {} s))
