@@ -74,8 +74,7 @@
           (fn [input ex]
             (if ex
               (cb nil ex)
-              (cb input nil)
-              #_(skip-if-eol io/*in* (fn [_] (cb input nil))))))))))
+              (skip-if-eol io/*in* (fn [_] (cb input nil))))))))))
 
 (defn repl-caught
   "Default :caught hook for repl"
