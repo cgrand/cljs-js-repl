@@ -13,18 +13,28 @@
 (defn socket-printer [socket]
   #(.write socket %))
 
+(defn bind-eval-fn [eval-fn env]
+  (dyn/bind-coop-fn (or eval-fn cljs/*eval-fn*) env))
+
 (defn eval [form cb]
-  (try
-    (cljs/eval 
-      lumo.repl/st ; private
-      form
-      (into (lumo.repl/make-eval-opts)
-        {:context :expr
-         :def-emits-var true})
-      (fn [{:keys [value ex-info]}]
-        (cb value ex-info)))
-    (catch :default e
-      (cb nil e))))
+  (let [env (atom nil)
+        cb (dyn/bind-coop-fn
+             (fn [{:keys [value ex-info]}]
+               (cb value ex-info))
+             env)]
+    (try
+      (cljs/eval
+        lumo.repl/st ; private
+        form
+        (-> (lumo.repl/make-eval-opts)
+          (into
+            {:context :expr
+             :def-emits-var true})
+          (update :eval-fn bind-eval-fn))
+        cb)
+      (reset! env (dyn/get-binding-env))
+     (catch :default e
+       (cb nil e)))))
 
 (defn accept [socket]
   (.setEncoding socket "utf8")

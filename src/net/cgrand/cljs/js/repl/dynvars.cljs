@@ -75,3 +75,19 @@
       (restore-snapshot! a)
       #(restore-snapshot! backup))
     (fn [])))
+
+(defn bind-coop-fn
+  "Wraps f in a way that the dynamic binding stack is propagated and updated.
+   (so it differs from bound-fn semantics)
+   env is an atom storing the environment, or nil when the environment is already set."
+  [f env]
+  (fn [& args]
+    (if-some [e @env]
+      (let [pop! (switch-bindings! e)]
+        (reset! env nil)
+        (try
+          (apply f args)
+          (finally
+            (reset! env (get-binding-env))
+            (pop!))))
+      (apply f args))))
