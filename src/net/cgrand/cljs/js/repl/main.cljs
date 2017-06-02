@@ -167,6 +167,9 @@
                           (if e 
                             (caught-ex e)
                             (do
+                              (set! *3 *2)
+                              (set! *2 *1)
+                              (set! *1 value)
                               (print value)
                               (prompt-read-eval-print))))))))))]
       (with-bindings
